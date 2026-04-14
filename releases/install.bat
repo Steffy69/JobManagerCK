@@ -9,9 +9,10 @@ set "SCRIPT_DIR=%~dp0"
 set "LOCAL_SOURCE=%SCRIPT_DIR%JobManager.exe"
 set "GITHUB_URL=https://github.com/Steffy69/JobManagerCK/releases/latest/download/JobManager.exe"
 set "FALLBACK_SOURCE=S:\Software\JobManagerCK\releases\JobManager.exe"
-set "INSTALL_DIR=C:\Program Files\JobManagerCK"
+set "INSTALL_DIR=%LOCALAPPDATA%\JobManagerCK"
 set "EXE=%INSTALL_DIR%\JobManager.exe"
 set "BACKUP=%INSTALL_DIR%\JobManager.exe.bak"
+set "LEGACY_DIR=C:\Program Files\JobManagerCK"
 set "DESKTOP=%USERPROFILE%\Desktop"
 set "SHORTCUT=%DESKTOP%\Job Manager CK.lnk"
 set "TEMP_DOWNLOAD=%TEMP%\JobManager_v21_download.exe"
@@ -56,7 +57,16 @@ echo Stopping any running Job Manager CK instances...
 taskkill /IM JobManager.exe /F >nul 2>&1
 timeout /t 1 /nobreak >nul
 
-echo Creating install directory...
+if exist "%LEGACY_DIR%\JobManager.exe" (
+    echo Found old install in Program Files - removing...
+    rmdir /s /q "%LEGACY_DIR%" >nul 2>&1
+    if exist "%LEGACY_DIR%" (
+        echo WARNING: Could not remove %LEGACY_DIR%
+        echo You may need to delete it manually ^(requires admin^).
+    )
+)
+
+echo Creating install directory at %INSTALL_DIR%...
 if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
 
 if exist "%EXE%" (

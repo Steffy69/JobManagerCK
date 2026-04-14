@@ -917,7 +917,6 @@ class JobManager(QMainWindow):
         progress.setAutoClose(False)
 
         self._downloader = UpdateDownloader(
-            source=info["source"],
             download_url=info.get("download_url", ""),
         )
         self._downloader.progress.connect(progress.setValue)
