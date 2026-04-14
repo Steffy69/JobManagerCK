@@ -7,28 +7,49 @@ echo.
 
 set "SCRIPT_DIR=%~dp0"
 set "LOCAL_SOURCE=%SCRIPT_DIR%JobManager.exe"
+set "GITHUB_URL=https://github.com/Steffy69/JobManagerCK/releases/latest/download/JobManager.exe"
 set "FALLBACK_SOURCE=S:\Software\JobManagerCK\releases\JobManager.exe"
 set "INSTALL_DIR=C:\Program Files\JobManagerCK"
 set "EXE=%INSTALL_DIR%\JobManager.exe"
 set "BACKUP=%INSTALL_DIR%\JobManager.exe.bak"
 set "DESKTOP=%USERPROFILE%\Desktop"
 set "SHORTCUT=%DESKTOP%\Job Manager CK.lnk"
+set "TEMP_DOWNLOAD=%TEMP%\JobManager_v21_download.exe"
+set "SOURCE="
 
 if exist "%LOCAL_SOURCE%" (
     set "SOURCE=%LOCAL_SOURCE%"
     echo Source: local ^(next to installer^)
-) else if exist "%FALLBACK_SOURCE%" (
-    set "SOURCE=%FALLBACK_SOURCE%"
-    echo Source: S drive
-) else (
-    echo ERROR: Cannot find JobManager.exe
-    echo   Looked in: %LOCAL_SOURCE%
-    echo   Looked in: %FALLBACK_SOURCE%
-    echo.
-    echo Put JobManager.exe next to install.bat, or connect the S drive.
-    pause
-    exit /b 1
+    goto :have_source
 )
+
+echo Source: downloading from GitHub...
+echo   %GITHUB_URL%
+powershell -NoProfile -Command "try { $ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '%GITHUB_URL%' -OutFile '%TEMP_DOWNLOAD%' -UseBasicParsing; exit 0 } catch { Write-Host $_.Exception.Message; exit 1 }"
+if exist "%TEMP_DOWNLOAD%" (
+    set "SOURCE=%TEMP_DOWNLOAD%"
+    echo Download complete.
+    goto :have_source
+)
+
+echo GitHub download failed, trying S drive fallback...
+if exist "%FALLBACK_SOURCE%" (
+    set "SOURCE=%FALLBACK_SOURCE%"
+    echo Source: S drive fallback
+    goto :have_source
+)
+
+echo.
+echo ERROR: Could not obtain JobManager.exe
+echo   - Tried local: %LOCAL_SOURCE%
+echo   - Tried GitHub: %GITHUB_URL%
+echo   - Tried S drive: %FALLBACK_SOURCE%
+echo.
+echo Check your internet connection or the S drive mapping.
+pause
+exit /b 1
+
+:have_source
 echo.
 
 echo Stopping any running Job Manager CK instances...
@@ -43,7 +64,7 @@ if exist "%EXE%" (
     copy /y "%EXE%" "%BACKUP%" >nul
 )
 
-echo Copying JobManager.exe...
+echo Copying JobManager.exe to %INSTALL_DIR%...
 copy /y "%SOURCE%" "%EXE%"
 if errorlevel 1 (
     echo.
@@ -53,6 +74,8 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+
+if exist "%TEMP_DOWNLOAD%" del /f /q "%TEMP_DOWNLOAD%" >nul 2>&1
 
 echo Removing stale desktop shortcut...
 if exist "%SHORTCUT%" del /f /q "%SHORTCUT%"
