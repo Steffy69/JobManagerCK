@@ -1,0 +1,5 @@
+{
+  "version": "2.1.0",
+  "download_url": "",
+  "release_notes": "v2.1 - Three-state status (Ready/In Progress/Printed), Printed jobs section, live Zebra status, Print Settings dialog, ZPL separators, pre-flight checks, peel-order print confirmation"
+}

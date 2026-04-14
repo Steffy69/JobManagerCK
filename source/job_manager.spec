@@ -10,7 +10,35 @@ a = Analysis(
         ('job_manager.ui', '.'),
         ('icon.ico', '.')
     ],
-    hiddenimports=['PyQt5.QtCore', 'PyQt5.QtGui', 'PyQt5.QtWidgets'],
+    hiddenimports=[
+        'PyQt5.QtCore',
+        'PyQt5.QtGui',
+        'PyQt5.QtWidgets',
+        'job_types',
+        'job_scanner',
+        'file_transfer',
+        'label_printer',
+        'usb_transfer',
+        'transfer_history',
+        'status_service',
+        'drop_zone',
+        'updater',
+        # v2.1: pywin32 modules for printer control and ShellExecute
+        'win32print',
+        'win32api',
+        'win32con',
+        'pywintypes',
+        # v2.1: new pure-Python modules — listed so PyInstaller bundles them
+        # even if static analysis misses any indirect import path.
+        'settings',
+        'preflight',
+        'printer_service',
+        'print_sequencer',
+        'zpl_templates',
+        'printer_status_widget',
+        'settings_dialog',
+        'print_order_dialog',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -42,5 +70,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='icon.ico'
+    icon='icon.ico',
 )

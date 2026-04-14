@@ -6,15 +6,21 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>600</width>
-    <height>500</height>
+    <width>500</width>
+    <height>600</height>
    </rect>
   </property>
+  <property name="minimumSize">
+   <size>
+    <width>500</width>
+    <height>600</height>
+   </size>
+  </property>
   <property name="windowTitle">
-   <string>Job File Manager</string>
+   <string>Job Manager CK v2.0</string>
   </property>
   <widget class="QWidget" name="centralwidget">
-   <layout class="QVBoxLayout" name="verticalLayout_2">
+   <layout class="QVBoxLayout" name="mainVerticalLayout">
     <item>
      <widget class="QLabel" name="titleLabel">
       <property name="font">
@@ -25,7 +31,7 @@
        </font>
       </property>
       <property name="text">
-       <string>Job File Manager</string>
+       <string>Job Manager CK</string>
       </property>
       <property name="alignment">
        <set>Qt::AlignCenter</set>
@@ -33,42 +39,141 @@
      </widget>
     </item>
     <item>
-     <widget class="QLabel" name="instructionLabel">
+     <widget class="QLabel" name="printerStatusLabel">
       <property name="text">
-       <string>Select a job from the list below to transfer its files:</string>
+       <string>Zebra: unknown</string>
+      </property>
+      <property name="alignment">
+       <set>Qt::AlignCenter</set>
       </property>
      </widget>
     </item>
     <item>
-     <widget class="QListWidget" name="jobListWidget"/>
+     <widget class="QTreeWidget" name="jobTreeWidget">
+      <property name="sizePolicy">
+       <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+        <horstretch>0</horstretch>
+        <verstretch>1</verstretch>
+       </sizepolicy>
+      </property>
+      <property name="headerHidden">
+       <bool>true</bool>
+      </property>
+      <property name="indentation">
+       <number>20</number>
+      </property>
+      <property name="animated">
+       <bool>true</bool>
+      </property>
+      <property name="rootIsDecorated">
+       <bool>true</bool>
+      </property>
+      <column>
+       <property name="text">
+        <string notr="true">1</string>
+       </property>
+      </column>
+     </widget>
     </item>
     <item>
-     <layout class="QHBoxLayout" name="buttonLayout">
+     <layout class="QHBoxLayout" name="buttonRow1Layout">
       <item>
        <widget class="QPushButton" name="refreshButton">
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>35</height>
+         </size>
+        </property>
         <property name="text">
-         <string>Refresh Jobs</string>
+         <string>Refresh</string>
         </property>
        </widget>
       </item>
       <item>
        <widget class="QPushButton" name="transferButton">
+        <property name="enabled">
+         <bool>false</bool>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>35</height>
+         </size>
+        </property>
         <property name="text">
-         <string>Transfer Files</string>
+         <string>Transfer to CADCode</string>
         </property>
        </widget>
       </item>
       <item>
-       <widget class="QPushButton" name="openSourceButton">
+       <widget class="QPushButton" name="printButton">
+        <property name="enabled">
+         <bool>false</bool>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>35</height>
+         </size>
+        </property>
         <property name="text">
-         <string>Open Source Folder</string>
+         <string>Print Labels</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </item>
+    <item>
+     <layout class="QHBoxLayout" name="buttonRow2Layout">
+      <item>
+       <widget class="QPushButton" name="copyNCButton">
+        <property name="enabled">
+         <bool>false</bool>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>35</height>
+         </size>
+        </property>
+        <property name="text">
+         <string>Copy NC to USB</string>
         </property>
        </widget>
       </item>
       <item>
-       <widget class="QPushButton" name="openDestButton">
+       <widget class="QPushButton" name="completeButton">
+        <property name="enabled">
+         <bool>false</bool>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>35</height>
+         </size>
+        </property>
         <property name="text">
-         <string>Open Destination</string>
+         <string>Move to Printed</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="restoreButton">
+        <property name="enabled">
+         <bool>true</bool>
+        </property>
+        <property name="visible">
+         <bool>false</bool>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>35</height>
+         </size>
+        </property>
+        <property name="text">
+         <string>Restore to Active</string>
         </property>
        </widget>
       </item>
@@ -81,7 +186,7 @@
     <rect>
      <x>0</x>
      <y>0</y>
-     <width>600</width>
+     <width>500</width>
      <height>22</height>
     </rect>
    </property>
