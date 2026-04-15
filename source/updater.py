@@ -12,7 +12,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 logger = logging.getLogger(__name__)
 
-CURRENT_VERSION = "2.1.4"
+CURRENT_VERSION = "2.1.5"
 GITHUB_API_URL = (
     "https://api.github.com/repos/Steffy69/JobManagerCK/releases/latest"
 )
