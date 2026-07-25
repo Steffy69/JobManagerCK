@@ -7,8 +7,13 @@ import sys
 import tempfile
 from typing import Optional
 
-import requests
 from PyQt5.QtCore import QThread, pyqtSignal
+
+# NOTE: ``requests`` is imported lazily inside the two methods that use it.
+# It pulls in urllib3, ssl, http.client, email and certifi — several hundred
+# modules to unmarshal out of the frozen bundle — and this module is imported
+# at start-up purely for CURRENT_VERSION (the window title). The first actual
+# HTTP call happens two seconds later, on a worker thread.
 
 logger = logging.getLogger(__name__)
 
@@ -50,10 +55,14 @@ class UpdateChecker(QThread):
         self.update_available.emit(info)
 
     def _fetch_latest_release(self) -> Optional[dict]:
+        import requests
+
         try:
             resp = requests.get(
                 GITHUB_API_URL,
-                timeout=10,
+                # (connect, read): fail fast on a dead network instead of
+                # holding the thread for the full read timeout.
+                timeout=(3, 10),
                 headers={"Accept": "application/vnd.github+json"},
             )
             resp.raise_for_status()
@@ -103,6 +112,8 @@ class UpdateDownloader(QThread):
             self.finished.emit(False, str(e))
 
     def _download(self, dest: str) -> None:
+        import requests
+
         if not self._download_url:
             raise ValueError("No download_url provided")
 

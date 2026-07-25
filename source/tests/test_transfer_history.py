@@ -196,3 +196,78 @@ def test_clear_moved_to_printed_preserves_print_flag(
     assert record.printed is True
     assert record.printed_at is not None
     assert record.completed_at is None
+
+
+# -- bulk status lookup + caching -------------------------------------------
+#
+# The job tree asks for one status per job on every refresh. These pin the
+# behaviour that keeps that from being one file read per job.
+
+
+def test_get_all_statuses_matches_get_status(history: TransferHistory) -> None:
+    """Bulk lookup must agree with the per-job call for every state."""
+    history.mark_transferred("JOB_IN_PROGRESS", "CABINETRY_ONLINE")
+    history.mark_printed("JOB_MOVED", "CUSTOM_DESIGN")
+    history.mark_moved_to_printed("JOB_MOVED", "CUSTOM_DESIGN")
+    history.mark_transferred("JOB_RESET", "CABINETRY_ONLINE")
+    history.clear_moved_to_printed("JOB_RESET")
+
+    statuses = history.get_all_statuses()
+
+    assert statuses["JOB_IN_PROGRESS"] == "In Progress"
+    assert statuses["JOB_MOVED"] == "Printed"
+    assert statuses["JOB_RESET"] == "In Progress"
+    for name, status in statuses.items():
+        assert status == history.get_status(name)
+
+
+def test_get_all_statuses_omits_untracked_jobs(history: TransferHistory) -> None:
+    """Untracked jobs are simply absent — callers default them to Ready."""
+    history.mark_transferred("TRACKED", "CABINETRY_ONLINE")
+
+    statuses = history.get_all_statuses()
+
+    assert "UNTRACKED" not in statuses
+    assert statuses.get("UNTRACKED", "Ready") == "Ready"
+
+
+def test_repeated_reads_hit_the_cache(history: TransferHistory, monkeypatch) -> None:
+    """Reading repeatedly without a write must not re-open the file."""
+    history.mark_transferred("JOB_A", "CABINETRY_ONLINE")
+    history.get_all_statuses()  # prime the cache
+
+    opens = []
+    real_open = open
+    monkeypatch.setattr(
+        "builtins.open",
+        lambda *a, **k: (opens.append(a[0]), real_open(*a, **k))[1],
+    )
+
+    for _ in range(5):
+        history.get_all_statuses()
+
+    assert opens == []
+
+
+def test_write_invalidates_cache(history: TransferHistory) -> None:
+    """A write must be visible to the next read, not masked by the cache."""
+    history.mark_transferred("JOB_A", "CABINETRY_ONLINE")
+    assert history.get_all_statuses()["JOB_A"] == "In Progress"
+
+    history.mark_moved_to_printed("JOB_A", "CABINETRY_ONLINE")
+
+    assert history.get_all_statuses()["JOB_A"] == "Printed"
+
+
+def test_external_modification_invalidates_cache(tmp_path) -> None:
+    """A second TransferHistory writing the file must not be masked."""
+    one = TransferHistory(history_dir=str(tmp_path))
+    two = TransferHistory(history_dir=str(tmp_path))
+
+    one.mark_transferred("JOB_A", "CABINETRY_ONLINE")
+    assert one.get_all_statuses()["JOB_A"] == "In Progress"
+
+    # Write through the other instance, then re-read through the first.
+    two.mark_moved_to_printed("JOB_A", "CABINETRY_ONLINE")
+
+    assert one.get_all_statuses()["JOB_A"] == "Printed"

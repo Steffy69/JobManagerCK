@@ -8,11 +8,18 @@ import logging
 import os
 import shutil
 import sys
-import winsound
 from typing import Optional
 
+try:
+    import winsound  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - non-Windows hosts (dev boxes, CI)
+    # Matches the guarded-import convention in printer_service: the module
+    # must stay importable off Windows so the test suite can construct the
+    # window. Sound is cosmetic, so its absence is a silent no-op.
+    winsound = None  # type: ignore[assignment]
+
 from PyQt5 import uic
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QIcon
 from PyQt5.QtWidgets import (
     QApplication,
@@ -29,6 +36,7 @@ import print_sequencer
 import printer_service
 from drop_zone import DropZone
 from file_transfer import FileTransferThread
+from job_scan_worker import JobScanThread
 from job_scanner import PRINTED_DIR, Job, scan_jobs, scan_printed_jobs
 from job_types import JobFiles, JobType, build_display_name, detect_job_type, scan_folder_files
 from label_printer import LabelPrinterThread
@@ -118,6 +126,15 @@ def _migrate_archive_to_printed() -> Optional[str]:
         return f"Could not migrate Archive to Printed: {exc}"
 
 
+def _beep(success: bool) -> None:
+    """Play the OK / error system sound, if the platform provides one."""
+    if winsound is None:
+        return
+    winsound.MessageBeep(
+        winsound.MB_OK if success else winsound.MB_ICONHAND
+    )
+
+
 def _build_tooltip(files: JobFiles) -> str:
     """Build a tooltip string showing file counts for a job."""
     parts: list[str] = []
@@ -134,6 +151,10 @@ def _build_tooltip(files: JobFiles) -> str:
 
 class JobManager(QMainWindow):
     """Main application window for JobManagerCK v2.1."""
+
+    #: Emitted after a background scan has been applied to the tree. Used by
+    #: tests to await the asynchronous refresh.
+    jobsRefreshed = pyqtSignal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -163,6 +184,14 @@ class JobManager(QMainWindow):
         self._active_root: Optional[QTreeWidgetItem] = None
         self._printed_root: Optional[QTreeWidgetItem] = None
 
+        # Identifies what the tree currently displays. A refresh whose result
+        # matches this skips the rebuild entirely, which is the common case —
+        # job folders change rarely, but the refresh timer fires constantly.
+        self._last_tree_signature: Optional[tuple] = None
+
+        # In-flight background scan, if any.
+        self._scan_thread: Optional[JobScanThread] = None
+
         # Printer status tracked via PrinterStatusWidget; assume offline
         # until the first poll reports otherwise. This is consulted by
         # _on_selection_changed when deciding whether to enable the
@@ -174,8 +203,7 @@ class JobManager(QMainWindow):
         self._source_folders = SOURCE_FOLDERS
         self._dest_path = DEST_PATH
 
-        # One-shot Archive -> Printed migration (safe no-op on subsequent launches).
-        self._migration_warning = _migrate_archive_to_printed()
+        self._migration_warning: Optional[str] = None
 
         # Drop zone
         self._drop_zone = DropZone()
@@ -183,15 +211,15 @@ class JobManager(QMainWindow):
         self.centralwidget.layout().insertWidget(2, self._drop_zone)
 
         self._setup_ui()
+
+        # Starts a worker thread and returns immediately, so the window is
+        # on screen and interactive while the S: drive is being walked.
         self.refresh_jobs()
 
-        if self._migration_warning:
-            QTimer.singleShot(
-                0,
-                lambda: QMessageBox.warning(
-                    self, "Folder migration", self._migration_warning
-                ),
-            )
+        # The Archive -> Printed migration probes two paths on the S: share.
+        # Deferred so those round-trips happen after the window is visible
+        # rather than in front of it.
+        QTimer.singleShot(0, self._run_migration)
 
         # Auto-refresh timer
         self._refresh_timer = QTimer(self)
@@ -199,6 +227,14 @@ class JobManager(QMainWindow):
         self._refresh_timer.start(AUTO_REFRESH_MS)
 
         QTimer.singleShot(2000, self._check_for_updates)
+
+    def _run_migration(self) -> None:
+        """Run the one-shot Archive -> Printed migration and report problems."""
+        self._migration_warning = _migrate_archive_to_printed()
+        if self._migration_warning:
+            QMessageBox.warning(
+                self, "Folder migration", self._migration_warning
+            )
 
     def _setup_ui(self) -> None:
         """Connect buttons, menus, and selection signals."""
@@ -298,12 +334,50 @@ class JobManager(QMainWindow):
             btn.setEnabled(enabled)
 
     def _set_ui_busy(self, busy: bool) -> None:
-        """Disable or re-enable the full UI during long operations."""
+        """Disable or re-enable the full UI during long operations.
+
+        Also parks the background polls. While a transfer or print is
+        running they compete with the worker for the same S: share and print
+        spooler, and their results cannot be acted on anyway because the
+        controls they feed are disabled.
+        """
         enabled = not busy
         self.refreshButton.setEnabled(enabled)
         self.jobTreeWidget.setEnabled(enabled)
         self._set_action_buttons_enabled(enabled)
         self.restoreButton.setEnabled(enabled)
+        self._set_polling_active(enabled)
+
+    def _set_polling_active(self, active: bool) -> None:
+        """Start or stop the job-refresh and printer-status polls."""
+        timer = getattr(self, "_refresh_timer", None)
+        if timer is not None:
+            if active and not timer.isActive():
+                timer.start(AUTO_REFRESH_MS)
+            elif not active and timer.isActive():
+                timer.stop()
+
+        # getattr: Qt can deliver events during uic.loadUi, before __init__
+        # has finished assigning our own attributes.
+        status_widget = getattr(self, "_printer_status", None)
+        if status_widget is not None:
+            try:
+                if active:
+                    status_widget.start()
+                else:
+                    status_widget.stop()
+            except Exception:  # noqa: BLE001 - polling is never load-bearing
+                logger.exception("Failed to toggle printer status polling")
+
+    def changeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        """Pause polling while the window is minimised.
+
+        Minimised means nothing the polls produce can be seen, but the scans
+        would still hammer the S: share and the print spooler all shift.
+        """
+        super().changeEvent(event)
+        if event.type() == QEvent.WindowStateChange:
+            self._set_polling_active(not self.isMinimized())
 
     # -- Auto-refresh --
 
@@ -312,120 +386,227 @@ class JobManager(QMainWindow):
         self._refresh_preserving_selection()
 
     def _refresh_preserving_selection(self) -> None:
-        """Rebuild the job tree while keeping the current selection if possible.
+        """Kick off a refresh; the tree keeps its selection across the rebuild.
 
-        The selection key is ``(job.name, is_printed)`` so a job that exists in
-        both the Active and Printed trees (shouldn't happen in practice, but
-        safe) is re-selected in the same tree it was chosen from.
+        Selection, expansion state and scroll position are preserved by
+        :meth:`_populate_tree` itself, so this is now simply a refresh. The
+        method is kept as the intention-revealing name used by call sites
+        that specifically care about not losing the user's place.
         """
-        selected = self._selected_job()
-        key: Optional[tuple[str, bool]] = None
-        if selected is not None:
-            key = (selected.name, selected.is_printed)
-
         self.refresh_jobs()
-
-        if key is None:
-            return
-
-        target_name, target_is_printed = key
-        roots = []
-        if self._active_root is not None and not target_is_printed:
-            roots.append(self._active_root)
-        if self._printed_root is not None and target_is_printed:
-            roots.append(self._printed_root)
-
-        for root in roots:
-            for i in range(root.childCount()):
-                child = root.child(i)
-                job = child.data(0, Qt.UserRole)
-                if isinstance(job, Job) and job.name == target_name:
-                    self.jobTreeWidget.setCurrentItem(child)
-                    return
-
-        # Job no longer exists — clear selection cleanly.
-        self.jobTreeWidget.setCurrentItem(None)
 
     # -- Job list --
 
     def refresh_jobs(self) -> None:
-        """Scan source folders and repopulate the job tree."""
-        self._active_jobs.clear()
-        self._printed_jobs.clear()
+        """Start a background scan of the source folders.
 
-        co_count = 0
-        cd_count = 0
+        The scan walks every job folder on the ``S:`` share, so it runs on a
+        worker thread — the GUI thread stays responsive and the auto-refresh
+        timer can never stall the window. Results are applied in
+        :meth:`_on_scan_finished`.
 
-        try:
-            active_scanned = scan_jobs()
-        except Exception:
-            logger.exception("Failed to scan job folders")
-            self.statusbar.showMessage("Error: could not read S drive")
+        If a scan is already in flight this is a no-op: the running scan will
+        deliver fresh results momentarily, and queueing another would only
+        add load to the share.
+        """
+        if self._scan_thread is not None and self._scan_thread.isRunning():
             return
 
-        for job in active_scanned:
-            self._active_jobs.append(job)
-            if job.job_type == JobType.CABINETRY_ONLINE:
-                co_count += 1
-            else:
-                cd_count += 1
+        # Only announce scanning when there is nothing on screen yet. On the
+        # periodic refresh the status bar may be showing transfer or print
+        # progress, and overwriting that every few seconds is noise.
+        if not self._active_jobs and not self._printed_jobs:
+            self.statusbar.showMessage("Scanning jobs...")
 
+        thread = JobScanThread(
+            scan_active=scan_jobs, scan_printed=scan_printed_jobs, parent=self
+        )
+        thread.scanned.connect(self._on_scan_finished)
+        thread.failed.connect(self._on_scan_failed)
+        # Retire the thread once it ends. It is parented to the window, so
+        # without this a new QThread child would accumulate on every tick of
+        # the refresh timer for the lifetime of the process.
+        thread.finished.connect(lambda t=thread: self._retire_scan_thread(t))
+        self._scan_thread = thread
+        thread.start()
+
+    def _retire_scan_thread(self, thread: JobScanThread) -> None:
+        """Drop and delete a finished scan thread."""
+        if self._scan_thread is thread:
+            self._scan_thread = None
+        thread.deleteLater()
+
+    def _on_scan_failed(self, _message: str) -> None:
+        """Report a failed scan without discarding the jobs already listed.
+
+        A transient S: drive blip should not blank a populated tree — the
+        next refresh a few seconds later will recover.
+        """
+        self.statusbar.showMessage("Error: could not read S drive")
+        self.jobsRefreshed.emit()
+
+    def _on_scan_finished(self, active: list, printed: list) -> None:
+        """Apply scan results from the worker thread to the tree."""
+        self._active_jobs = list(active)
         # Re-add dropped jobs (treat as active).
-        for name, job in self._dropped_jobs.items():
-            self._active_jobs.append(job)
+        self._active_jobs.extend(self._dropped_jobs.values())
+        self._printed_jobs = list(printed)
 
+        changed = self._populate_tree()
+
+        # Only refresh the counts when something actually changed, so a
+        # running transfer or print keeps its progress message visible.
+        if changed:
+            co_count = sum(
+                1 for j in self._active_jobs
+                if j.job_type == JobType.CABINETRY_ONLINE
+            )
+            cd_count = len(self._active_jobs) - co_count
+            self.statusbar.showMessage(
+                f"Found {len(self._active_jobs)} active "
+                f"({co_count} CO, {cd_count} CD), "
+                f"{len(self._printed_jobs)} printed"
+            )
+
+        self.jobsRefreshed.emit()
+
+    def _tree_signature(self, statuses: dict[str, str]) -> tuple:
+        """Return a value identifying exactly what the tree should display.
+
+        ``Job`` and ``JobFiles`` are frozen dataclasses, so comparing them
+        compares every rendered field. Statuses are folded in because they
+        drive the row colour. If this is unchanged since the last rebuild,
+        the tree is already correct and rebuilding it would only cost the
+        user their scroll position and expansion state.
+        """
+        return (
+            tuple(self._active_jobs),
+            tuple(self._printed_jobs),
+            tuple(statuses.get(j.name, "Ready") for j in self._active_jobs),
+        )
+
+    def _populate_tree(self) -> bool:
+        """Fill the QTreeWidget with two roots: Active Jobs + Printed Jobs.
+
+        Returns True if the tree was rebuilt, False if it was already showing
+        exactly this content and the rebuild was skipped.
+        """
+        # One read of the history file for the whole tree, rather than one
+        # read per job.
+        statuses = self._history.get_all_statuses()
+
+        signature = self._tree_signature(statuses)
+        if signature == self._last_tree_signature:
+            return False
+
+        tree = self.jobTreeWidget
+
+        # Remember the user's place so a background refresh doesn't move it.
+        selected = self._selected_job()
+        selection_key: Optional[tuple[str, bool]] = (
+            (selected.name, selected.is_printed) if selected is not None else None
+        )
+        first_build = self._last_tree_signature is None
+        if first_build:
+            active_expanded, printed_expanded = True, False
+        else:
+            active_expanded = (
+                self._active_root.isExpanded()
+                if self._active_root is not None else True
+            )
+            printed_expanded = (
+                self._printed_root.isExpanded()
+                if self._printed_root is not None else False
+            )
+        scroll_value = tree.verticalScrollBar().value()
+
+        # Suppress painting and selection signals for the whole rebuild:
+        # clear() and each addChild() would otherwise trigger layout work and
+        # re-entrant selection handling per item.
+        tree.setUpdatesEnabled(False)
+        blocked = tree.blockSignals(True)
         try:
-            self._printed_jobs = scan_printed_jobs()
-        except Exception:
-            logger.exception("Failed to scan printed job folder")
-            self._printed_jobs = []
+            tree.clear()
 
-        self._populate_tree()
-        total = len(self._active_jobs)
-        printed_total = len(self._printed_jobs)
-        self.statusbar.showMessage(
-            f"Found {total} active ({co_count} CO, {cd_count} CD), "
-            f"{printed_total} printed"
-        )
+            active_root = QTreeWidgetItem(["Active Jobs"])
+            printed_root = QTreeWidgetItem(
+                [f"Printed Jobs ({len(self._printed_jobs)})"]
+            )
 
-    def _populate_tree(self) -> None:
-        """Fill the QTreeWidget with two roots: Active Jobs + Printed Jobs."""
-        self.jobTreeWidget.clear()
+            tree.addTopLevelItem(active_root)
+            tree.addTopLevelItem(printed_root)
 
-        active_root = QTreeWidgetItem(["Active Jobs"])
-        printed_root = QTreeWidgetItem(
-            [f"Printed Jobs ({len(self._printed_jobs)})"]
-        )
+            for job in self._active_jobs:
+                active_root.addChild(self._build_job_item(job, statuses))
 
-        self.jobTreeWidget.addTopLevelItem(active_root)
-        self.jobTreeWidget.addTopLevelItem(printed_root)
+            for job in self._printed_jobs:
+                item = self._build_job_item(job, statuses)
+                # Printed jobs always wear the grey colour, regardless of what
+                # the history file says — they were explicitly moved out of
+                # Active.
+                item.setForeground(0, COLOR_PRINTED_FINAL)
+                printed_root.addChild(item)
 
-        for job in self._active_jobs:
-            item = self._build_job_item(job)
-            active_root.addChild(item)
+            active_root.setExpanded(active_expanded)
+            printed_root.setExpanded(printed_expanded)
 
-        for job in self._printed_jobs:
-            item = self._build_job_item(job)
-            # Printed jobs always wear the grey colour, regardless of what the
-            # history file says — they were explicitly moved out of Active.
-            item.setForeground(0, COLOR_PRINTED_FINAL)
-            printed_root.addChild(item)
+            self._active_root = active_root
+            self._printed_root = printed_root
 
-        active_root.setExpanded(True)
-        printed_root.setExpanded(False)
+            self._restore_selection(selection_key)
+            tree.verticalScrollBar().setValue(scroll_value)
+        finally:
+            tree.blockSignals(blocked)
+            tree.setUpdatesEnabled(True)
 
-        self._active_root = active_root
-        self._printed_root = printed_root
+        self._last_tree_signature = signature
+        # Signals were blocked during the rebuild, so drive the selection
+        # handler once by hand to bring the buttons back in sync.
+        self._on_selection_changed()
+        return True
 
-    def _build_job_item(self, job: Job) -> QTreeWidgetItem:
-        """Create a QTreeWidgetItem for a Job with label, tooltip, and colour."""
+    def _restore_selection(self, key: Optional[tuple[str, bool]]) -> None:
+        """Re-select the job identified by *key* after a rebuild.
+
+        The key is ``(job.name, is_printed)`` so a job present in both the
+        Active and Printed trees (shouldn't happen in practice, but safe) is
+        re-selected in the same tree it was chosen from. A job that no longer
+        exists clears the selection cleanly.
+        """
+        if key is None:
+            return
+
+        target_name, target_is_printed = key
+        root = self._printed_root if target_is_printed else self._active_root
+        if root is not None:
+            for i in range(root.childCount()):
+                child = root.child(i)
+                job = child.data(0, Qt.UserRole)
+                if isinstance(job, Job) and job.name == target_name:
+                    # A restored selection inside a collapsed root would be
+                    # invisible — make sure the user can see it.
+                    root.setExpanded(True)
+                    self.jobTreeWidget.setCurrentItem(child)
+                    return
+
+        self.jobTreeWidget.setCurrentItem(None)
+
+    def _build_job_item(
+        self, job: Job, statuses: dict[str, str]
+    ) -> QTreeWidgetItem:
+        """Create a QTreeWidgetItem for a Job with label, tooltip, and colour.
+
+        *statuses* is the pre-read ``{job_name: status}`` map from
+        :meth:`TransferHistory.get_all_statuses`, so building a row costs no
+        file I/O.
+        """
         tag = "CO" if job.job_type == JobType.CABINETRY_ONLINE else "CD"
         label = f"[{tag}] {job.display_name or job.name}"
         item = QTreeWidgetItem([label])
         item.setData(0, Qt.UserRole, job)
         item.setToolTip(0, _build_tooltip(job.files))
 
-        status = self._history.get_status(job.name)
+        status = statuses.get(job.name, "Ready")
         if status == "Ready":
             item.setForeground(0, COLOR_READY)
         elif status == "In Progress":
@@ -583,8 +764,14 @@ class JobManager(QMainWindow):
             self._show_preflight_failure(printer_result)
             return
 
-        # Resolve the actual printer name: user override wins, else auto-find.
-        zebra = self._settings.zebra_printer_name or printer_service.find_zebra_printer()
+        # Resolve the actual printer name: user override wins, then the name
+        # the status widget already resolved on its last poll, and only as a
+        # last resort another spooler enumeration.
+        zebra = self._settings.zebra_printer_name
+        if not zebra and self._printer_status is not None:
+            zebra = self._printer_status.resolved_printer_name()
+        if not zebra:
+            zebra = printer_service.find_zebra_printer()
         if not zebra:
             QMessageBox.warning(
                 self,
@@ -843,11 +1030,11 @@ class JobManager(QMainWindow):
                 self._history.mark_printed(job_name, job_type_name)
             elif history_action == "nc_copied":
                 self._history.mark_nc_copied(job_name, job_type_name)
-            winsound.MessageBeep(winsound.MB_OK)
+            _beep(True)
             QMessageBox.information(self, "Success", message)
             self._refresh_preserving_selection()
         else:
-            winsound.MessageBeep(winsound.MB_ICONHAND)
+            _beep(False)
             QMessageBox.critical(self, "Error", message)
 
         self.statusbar.showMessage("Ready")
@@ -871,8 +1058,12 @@ class JobManager(QMainWindow):
         )
         self._dropped_jobs[name] = job
 
-        # Rebuild the tree so the dropped job appears immediately.
-        self.refresh_jobs()
+        # The dropped job is fully scanned already — add it to the tree
+        # directly rather than re-walking the whole S: share to rediscover
+        # something we're holding in hand.
+        if job not in self._active_jobs:
+            self._active_jobs.append(job)
+        self._populate_tree()
 
         # Select the dropped job under the Active root.
         if self._active_root is not None:
@@ -880,6 +1071,7 @@ class JobManager(QMainWindow):
                 child = self._active_root.child(i)
                 child_job = child.data(0, Qt.UserRole)
                 if isinstance(child_job, Job) and child_job.name == name:
+                    self._active_root.setExpanded(True)
                     self.jobTreeWidget.setCurrentItem(child)
                     break
 
@@ -888,6 +1080,13 @@ class JobManager(QMainWindow):
     # -- Update system --
 
     def _check_for_updates(self) -> None:
+        # Rebinding _update_checker while a check is in flight would drop the
+        # only reference to a running QThread and PyQt would destroy it
+        # mid-run. The Help menu item and the start-up check share this path.
+        existing = getattr(self, "_update_checker", None)
+        if existing is not None and existing.isRunning():
+            return
+
         self.statusbar.showMessage("Checking for updates...")
         self._update_checker = UpdateChecker()
         self._update_checker.update_available.connect(self._handle_update_available)
@@ -990,7 +1189,11 @@ class JobManager(QMainWindow):
     # -- Window lifecycle ------------------------------------------------
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
-        """Stop the printer status poll and tear the widget down cleanly."""
+        """Stop all polling and tear background work down cleanly."""
+        timer = getattr(self, "_refresh_timer", None)
+        if timer is not None:
+            timer.stop()
+
         if self._printer_status is not None:
             try:
                 self._printer_status.stop()
@@ -998,6 +1201,19 @@ class JobManager(QMainWindow):
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to stop printer status widget")
             self._printer_status = None
+
+        # Let an in-flight scan finish before the window goes away, so its
+        # completion slot never runs against half-destroyed widgets.
+        if self._scan_thread is not None:
+            try:
+                self._scan_thread.scanned.disconnect(self._on_scan_finished)
+                self._scan_thread.failed.disconnect(self._on_scan_failed)
+            except TypeError:
+                pass  # already disconnected
+            if self._scan_thread.isRunning():
+                self._scan_thread.wait(5000)
+            self._scan_thread = None
+
         super().closeEvent(event)
 
 
