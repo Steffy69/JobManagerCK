@@ -36,6 +36,15 @@ def migrate_archive_to_printed() -> str | None:
     continue to launch.
     """
     try:
+        if not os.path.isdir(r"S:\Jobs"):
+            # The whole share is unreachable (laptop off the workshop
+            # network, VPN down). Nothing to migrate — and popping a
+            # "Could not migrate" warning on every launch of a machine
+            # that simply doesn't have S: mapped is pure noise. The job
+            # scan already reports the share being down in the status bar.
+            logger.info("S:\\Jobs unreachable; skipping Archive migration")
+            return None
+
         archive_exists = os.path.isdir(ARCHIVE_DIR_LEGACY)
         printed_exists = os.path.isdir(PRINTED_DIR)
 
