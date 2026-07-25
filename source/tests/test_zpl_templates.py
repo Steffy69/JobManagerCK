@@ -9,31 +9,9 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from zpl_templates import (
     build_job_separator,
-    build_material_separator,
     build_test_separator,
     sanitize_zpl_field,
 )
-
-
-# ---------------------------------------------------------------------------
-# build_material_separator
-# ---------------------------------------------------------------------------
-
-
-def test_material_separator_contains_material():
-    result = build_material_separator("WHMR")
-    assert b"WHMR" in result
-
-
-def test_material_separator_starts_with_xa_ends_with_xz():
-    result = build_material_separator("WHMR")
-    assert result.startswith(b"^XA")
-    assert result.rstrip().endswith(b"^XZ")
-
-
-def test_material_separator_returns_bytes():
-    result = build_material_separator("WHMR")
-    assert isinstance(result, bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -140,15 +118,15 @@ def test_build_with_unsafe_chars():
 
 def test_ascii_encoding_replaces_non_ascii():
     """Non-ASCII characters must be replaced, not raise."""
-    result = build_material_separator("WHMR Ω")
+    result = build_job_separator("JOB", "WHMR Ω")
     assert isinstance(result, bytes)
     assert b"WHMR" in result
     # Omega is not ASCII, so it should be replaced with '?'
     assert b"?" in result
 
 
-def test_material_separator_handles_caret_in_input():
-    result = build_material_separator("WH^MR")
+def test_job_separator_handles_caret_in_material():
+    result = build_job_separator("JOB", "WH^MR")
     assert result.startswith(b"^XA")
     assert b"WH MR" in result
     assert b"WH^MR" not in result

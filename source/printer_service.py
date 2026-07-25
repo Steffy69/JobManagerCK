@@ -11,6 +11,7 @@ raises :class:`PrinterServiceUnavailable`.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -44,12 +45,47 @@ def list_printers() -> list[str]:
     return [entry[2] for entry in printers]
 
 
+_ZEBRA_NAME_HINTS: tuple[str, ...] = (
+    "zebra",
+    "zdesigner",
+    "gc420",
+    "gk420",
+    "gx420",
+    "gt800",
+    "zd410",
+    "zd420",
+    "zd421",
+    "zd500",
+    "zd620",
+    "zt230",
+    "zt410",
+    "zt420",
+)
+
+
+def is_zebra_name(name: str) -> bool:
+    """Return True if ``name`` matches a known Zebra driver hint.
+
+    Matches "zebra" (the friendly driver name), "zdesigner" (Zebra's default
+    Windows driver prefix), and common GC/GK/GX/ZD/ZT model families. All
+    matches are case-insensitive substring checks.
+
+    Exposed separately from :func:`find_zebra_printer` so callers that have
+    already enumerated the spooler — such as the status widget's poll — can
+    reuse the same matching rules without paying for a second enumeration.
+    """
+    lowered = name.lower()
+    return any(hint in lowered for hint in _ZEBRA_NAME_HINTS)
+
+
+def match_zebra_printer(names: list[str]) -> Optional[str]:
+    """Return the first name in ``names`` that looks like a Zebra, else None."""
+    return next((name for name in names if is_zebra_name(name)), None)
+
+
 def find_zebra_printer() -> Optional[str]:
-    """Return the first printer name containing 'Zebra' (case-insensitive)."""
-    for name in list_printers():
-        if "zebra" in name.lower():
-            return name
-    return None
+    """Return the first installed printer matching a known Zebra driver hint."""
+    return match_zebra_printer(list_printers())
 
 
 def is_printer_available(printer_name: str) -> bool:
@@ -117,6 +153,53 @@ def print_via_shellexecute(printer_name: str, file_path: str) -> None:
         )
 
     win32api.ShellExecute(0, "printto", file_path, f'"{printer_name}"', ".", 0)
+
+
+def print_via_default_swap(
+    printer_name: str,
+    file_path: str,
+    settle_seconds: float = 1.5,
+) -> None:
+    """Print ``file_path`` via a temporary Windows-default-printer swap.
+
+    Some third-party print handlers (e.g. labelMaker for ``.ljd`` files)
+    reject the ``printto`` verb or mis-parse printer names that contain
+    parentheses or other special characters. This fallback sidesteps the
+    issue by:
+
+    1. Saving the current Windows default printer.
+    2. Setting the default to ``printer_name``.
+    3. Invoking the plain ``print`` verb via ``ShellExecute`` (no printer arg).
+    4. Sleeping ``settle_seconds`` so the handler has time to read the new
+       default before we restore.
+    5. Restoring the previous default in a ``finally`` block — the user's
+       default is never left pointing at the label printer on error.
+
+    Raises :class:`PrinterServiceUnavailable` if pywin32 is unavailable.
+    """
+    if not HAS_WIN32:
+        raise PrinterServiceUnavailable(
+            "pywin32 is not installed; cannot swap default printer"
+        )
+
+    previous_default: Optional[str] = None
+    try:
+        previous_default = win32print.GetDefaultPrinter()
+    except Exception:  # noqa: BLE001 - non-fatal; we just won't restore
+        logger.exception("GetDefaultPrinter failed while preparing swap")
+
+    win32print.SetDefaultPrinter(printer_name)
+    try:
+        win32api.ShellExecute(0, "print", file_path, None, ".", 0)
+        time.sleep(max(0.0, settle_seconds))
+    finally:
+        if previous_default and previous_default != printer_name:
+            try:
+                win32print.SetDefaultPrinter(previous_default)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Failed to restore default printer to %r", previous_default
+                )
 
 
 def clear_print_queue(printer_name: str) -> int:

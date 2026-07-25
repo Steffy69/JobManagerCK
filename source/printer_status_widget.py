@@ -17,7 +17,7 @@ import logging
 from PyQt5.QtCore import QThread, QTimer, Qt, pyqtSignal
 from PyQt5.QtWidgets import QHBoxLayout, QLabel, QWidget
 
-from printer_service import list_printers
+from printer_service import list_printers, match_zebra_printer
 
 logger = logging.getLogger(__name__)
 
@@ -171,9 +171,10 @@ class PrinterStatusWidget(QWidget):
             names = list_printers()
             target = self._printer_name
             if not target:
-                target = next(
-                    (n for n in names if "zebra" in n.lower()), ""
-                )
+                # Shared matcher so the pill agrees with preflight and the
+                # Print click about what counts as a Zebra — the stock driver
+                # installs as "ZDesigner GC420d", with no "zebra" in the name.
+                target = match_zebra_printer(names) or ""
             return (bool(target) and target in names), target
         except Exception:  # noqa: BLE001 — contract: poll never raises
             logger.exception("PrinterStatusWidget poll failed")

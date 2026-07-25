@@ -172,7 +172,7 @@ def build_sequence_peel_preview(
             flush_group()
             separator_total += 1
             line_index += 1
-            if item.is_job_separator and item.job_name:
+            if item.job_name:
                 sep_text = f"{item.job_name} / {item.material}"
             else:
                 sep_text = item.material
@@ -248,7 +248,7 @@ class LabelPrinterThread(QThread):
                 return f"{item.material} #{item.board_number} ({base})"
             return base
         if item.kind == SEPARATOR_LABEL_KIND:
-            if item.is_job_separator and item.job_name:
+            if item.job_name:
                 return f"Separator: {item.job_name} / {item.material}"
             return f"Separator: {item.material}"
         return f"<unknown item kind: {item.kind}>"
@@ -284,18 +284,28 @@ class LabelPrinterThread(QThread):
                 self.progress.emit(index, total, description)
 
                 if item.kind == LABEL_KIND:
-                    printer_service.print_via_shellexecute(
-                        self._zebra_printer, item.file_path
-                    )
+                    try:
+                        printer_service.print_via_shellexecute(
+                            self._zebra_printer, item.file_path
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "printto failed for %s (%s); falling back to "
+                            "default-printer swap",
+                            Path(item.file_path).name,
+                            exc,
+                        )
+                        printer_service.print_via_default_swap(
+                            self._zebra_printer,
+                            item.file_path,
+                            settle_seconds=max(delay, 1.5),
+                        )
                     label_count += 1
                     logger.debug("Sent label %d/%d: %s", index, total, description)
                 elif item.kind == SEPARATOR_LABEL_KIND:
-                    if item.is_job_separator:
-                        zpl = zpl_templates.build_job_separator(
-                            item.job_name, item.material
-                        )
-                    else:
-                        zpl = zpl_templates.build_material_separator(item.material)
+                    zpl = zpl_templates.build_job_separator(
+                        item.job_name, item.material
+                    )
                     printer_service.send_raw_zpl(
                         self._zebra_printer,
                         zpl,

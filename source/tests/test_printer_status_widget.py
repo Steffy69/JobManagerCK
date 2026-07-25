@@ -119,6 +119,25 @@ def test_check_status_no_emit_on_same_state(qtbot, stub_printer_service):
     assert emissions == [True]
 
 
+def test_auto_detect_matches_stock_zdesigner_driver(qtbot, stub_printer_service):
+    """The pill must recognise the stock Zebra driver name.
+
+    Zebra's standard Windows driver installs as "ZDesigner GC420d", which
+    contains no "zebra" substring. The widget shares printer_service's hint
+    matching so the status pill agrees with preflight and the Print click —
+    otherwise the printer passes preflight while the pill reads Disconnected,
+    which leaves the Print button disabled.
+    """
+    stub_printer_service["names"] = ["Microsoft Print to PDF", "ZDesigner GC420d"]
+    widget = PrinterStatusWidget(poll_interval_ms=10_000, printer_name="")
+    qtbot.addWidget(widget)
+
+    widget._check_status()
+
+    assert widget.is_online() is True
+    assert widget.resolved_printer_name() == "ZDesigner GC420d"
+
+
 def test_single_enumeration_per_poll(qtbot, stub_printer_service):
     """Auto-detect resolves target and availability from one enumeration."""
     stub_printer_service["names"] = ["Zebra GC420D"]

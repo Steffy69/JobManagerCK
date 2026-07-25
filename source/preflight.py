@@ -100,18 +100,14 @@ def check_usb_free_space(usb_path: str, required_mb: int) -> PreflightResult:
 
 
 def check_printer_available(printer_name: str) -> PreflightResult:
-    try:
-        import win32print  # type: ignore[import-not-found]
-    except ImportError:
+    import printer_service
+
+    if not printer_service.HAS_WIN32:
         # Non-Windows dev environment — degrade gracefully so tests pass.
         return PreflightResult.success()
 
     try:
-        flags = (
-            win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
-        )
-        printers = win32print.EnumPrinters(flags)
-        names = [entry[2] for entry in printers]
+        names = printer_service.list_printers()
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("EnumPrinters failed: %s", exc)
         return PreflightResult.failure(
@@ -131,9 +127,10 @@ def check_printer_available(printer_name: str) -> PreflightResult:
             ),
         )
 
-    for name in names:
-        if "zebra" in name.lower():
-            return PreflightResult.success()
+    # Match against the names already enumerated above rather than calling
+    # find_zebra_printer(), which would enumerate the spooler a second time.
+    if printer_service.match_zebra_printer(names) is not None:
+        return PreflightResult.success()
     return PreflightResult.failure(
         "Printer Not Found",
         (

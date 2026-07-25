@@ -206,7 +206,7 @@ def build_print_sequence(
                     material=material,
                     board_number=None,
                     is_job_separator=is_topmost,
-                    job_name=job_name if is_topmost else "",
+                    job_name=job_name,
                 )
             )
         for board, path in entries:

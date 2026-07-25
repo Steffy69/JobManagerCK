@@ -88,6 +88,23 @@ def test_find_zebra_printer_none_found(fake_win32print):
     assert printer_service.find_zebra_printer() is None
 
 
+def test_find_zebra_printer_matches_zdesigner_default_driver(fake_win32print):
+    fake_win32print.EnumPrinters.return_value = [
+        (0, "", "HP LaserJet", "port1"),
+        (0, "", "ZDesigner GC420d", "port2"),
+    ]
+
+    assert printer_service.find_zebra_printer() == "ZDesigner GC420d"
+
+
+def test_find_zebra_printer_matches_model_only_name(fake_win32print):
+    fake_win32print.EnumPrinters.return_value = [
+        (0, "", "GC420d", "port1"),
+    ]
+
+    assert printer_service.find_zebra_printer() == "GC420d"
+
+
 # ---------------------------------------------------------------------------
 # is_printer_available
 # ---------------------------------------------------------------------------
@@ -216,6 +233,68 @@ def test_print_via_shellexecute_calls_api(fake_win32api):
 def test_print_via_shellexecute_raises_when_unavailable(no_win32):
     with pytest.raises(PrinterServiceUnavailable):
         printer_service.print_via_shellexecute("Zebra", "C:/tmp/label.pdf")
+
+
+# ---------------------------------------------------------------------------
+# print_via_default_swap
+# ---------------------------------------------------------------------------
+
+
+def test_print_via_default_swap_restores_previous_default(
+    fake_win32print, fake_win32api, monkeypatch
+):
+    fake_win32print.GetDefaultPrinter.return_value = "HP LaserJet"
+    monkeypatch.setattr(printer_service.time, "sleep", lambda _s: None)
+
+    printer_service.print_via_default_swap(
+        "ZDesigner GC420d (EPL)", "C:/tmp/label.ljd", settle_seconds=0
+    )
+
+    assert fake_win32print.SetDefaultPrinter.call_args_list == [
+        call("ZDesigner GC420d (EPL)"),
+        call("HP LaserJet"),
+    ]
+    fake_win32api.ShellExecute.assert_called_once_with(
+        0, "print", "C:/tmp/label.ljd", None, ".", 0
+    )
+
+
+def test_print_via_default_swap_restores_on_shellexecute_error(
+    fake_win32print, fake_win32api, monkeypatch
+):
+    fake_win32print.GetDefaultPrinter.return_value = "HP LaserJet"
+    fake_win32api.ShellExecute.side_effect = OSError("boom")
+    monkeypatch.setattr(printer_service.time, "sleep", lambda _s: None)
+
+    with pytest.raises(OSError, match="boom"):
+        printer_service.print_via_default_swap(
+            "ZDesigner GC420d (EPL)", "C:/tmp/label.ljd"
+        )
+
+    assert fake_win32print.SetDefaultPrinter.call_args_list == [
+        call("ZDesigner GC420d (EPL)"),
+        call("HP LaserJet"),
+    ]
+
+
+def test_print_via_default_swap_skips_restore_when_previous_equals_target(
+    fake_win32print, fake_win32api, monkeypatch
+):
+    fake_win32print.GetDefaultPrinter.return_value = "ZDesigner GC420d (EPL)"
+    monkeypatch.setattr(printer_service.time, "sleep", lambda _s: None)
+
+    printer_service.print_via_default_swap(
+        "ZDesigner GC420d (EPL)", "C:/tmp/label.ljd"
+    )
+
+    assert fake_win32print.SetDefaultPrinter.call_args_list == [
+        call("ZDesigner GC420d (EPL)"),
+    ]
+
+
+def test_print_via_default_swap_raises_when_unavailable(no_win32):
+    with pytest.raises(PrinterServiceUnavailable):
+        printer_service.print_via_default_swap("Zebra", "C:/tmp/label.ljd")
 
 
 # ---------------------------------------------------------------------------

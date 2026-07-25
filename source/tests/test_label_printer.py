@@ -210,9 +210,9 @@ def test_peel_preview_jelprewir_example() -> None:
     assert lines[0] == "Peel order (top of roll -> bottom):"
     assert lines[1] == "  1. [SEP] JELPREWIR CL / WHMR"
     assert lines[2] == "  2. WHMR labels (34)"
-    assert lines[3] == "  3. [SEP] WALNUT"
+    assert lines[3] == "  3. [SEP] JELPREWIR CL / WALNUT"
     assert lines[4] == "  4. WALNUT labels (16)"
-    assert lines[5] == "  5. [SEP] BlackHMR"
+    assert lines[5] == "  5. [SEP] JELPREWIR CL / BlackHMR"
     assert lines[6] == "  6. BlackHMR labels (3)"
 
 
@@ -259,7 +259,22 @@ def test_describe_item_label_includes_material_and_board() -> None:
     assert "JOB_WHMR_0007.ljd" in desc
 
 
-def test_describe_item_material_separator() -> None:
+def test_describe_item_material_separator_includes_job_name() -> None:
+    item = PrintItem(
+        kind=SEPARATOR_LABEL_KIND,
+        file_path="",
+        material="WALNUT",
+        board_number=None,
+        is_job_separator=False,
+        job_name="JELPREWIR CL",
+    )
+    desc = LabelPrinterThread._describe_item(item)
+    assert "JELPREWIR CL" in desc
+    assert "WALNUT" in desc
+    assert desc.startswith("Separator:")
+
+
+def test_describe_item_separator_without_job_name_falls_back_to_material() -> None:
     item = PrintItem(
         kind=SEPARATOR_LABEL_KIND,
         file_path="",

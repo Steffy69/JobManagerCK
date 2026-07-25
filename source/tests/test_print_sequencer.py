@@ -273,12 +273,12 @@ def test_build_sequence_jelprewir_full_example():
         assert item.material == "BlackHMR"
         assert item.board_number == expected_board
 
-    # Item 3 — material separator for BlackHMR
+    # Item 3 — material separator for BlackHMR (carries job_name for context)
     sep_black = seq[3]
     assert sep_black.kind == SEPARATOR_LABEL_KIND
     assert sep_black.material == "BlackHMR"
     assert sep_black.is_job_separator is False
-    assert sep_black.job_name == ""
+    assert sep_black.job_name == "JELPREWIR CL"
 
     # Items 4..19 — WALNUT 16, 15, ..., 1
     for idx in range(16):
@@ -287,12 +287,12 @@ def test_build_sequence_jelprewir_full_example():
         assert item.material == "WALNUT"
         assert item.board_number == 16 - idx
 
-    # Item 20 — material separator for WALNUT
+    # Item 20 — material separator for WALNUT (carries job_name for context)
     sep_walnut = seq[20]
     assert sep_walnut.kind == SEPARATOR_LABEL_KIND
     assert sep_walnut.material == "WALNUT"
     assert sep_walnut.is_job_separator is False
-    assert sep_walnut.job_name == ""
+    assert sep_walnut.job_name == "JELPREWIR CL"
 
     # Items 21..54 — WHMR 34, 33, ..., 1
     for idx in range(34):
@@ -408,6 +408,7 @@ def test_build_sequence_two_materials_both_have_material_separators_except_top()
     assert seq[1].kind == SEPARATOR_LABEL_KIND
     assert seq[1].material == "WALNUT"
     assert seq[1].is_job_separator is False
+    assert seq[1].job_name == "JOB"
     assert seq[2].material == "WHMR" and seq[2].board_number == 2
     assert seq[3].material == "WHMR" and seq[3].board_number == 1
     assert seq[4].kind == SEPARATOR_LABEL_KIND

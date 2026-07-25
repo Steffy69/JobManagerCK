@@ -124,14 +124,9 @@ def test_estimate_nc_files_size_skips_missing(tmp_path: Path) -> None:
     assert total == 42
 
 
-def test_check_printer_available_without_win32print() -> None:
-    saved_win32print = sys.modules.pop("win32print", None)
-    sys.modules["win32print"] = None  # type: ignore[assignment]
-    try:
-        result = check_printer_available("")
-    finally:
-        if saved_win32print is not None:
-            sys.modules["win32print"] = saved_win32print
-        else:
-            sys.modules.pop("win32print", None)
+def test_check_printer_available_without_win32print(monkeypatch) -> None:
+    import printer_service
+
+    monkeypatch.setattr(printer_service, "HAS_WIN32", False)
+    result = check_printer_available("")
     assert result.ok is True

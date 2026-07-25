@@ -52,23 +52,6 @@ def _encode(zpl: str) -> bytes:
     return zpl.encode("ascii", errors="replace")
 
 
-def build_material_separator(material: str) -> bytes:
-    """Build a ZPL label showing only the material name, large and bold.
-
-    Used as a section divider between stacks of parts of the same
-    material so Marinko can see the material at a glance while peeling
-    labels off the roll.
-    """
-    safe_material = sanitize_zpl_field(material)
-    zpl = (
-        "^XA\n"
-        "^CF0,100\n"
-        f"^FO40,80^FD{safe_material}^FS\n"
-        "^XZ\n"
-    )
-    return _encode(zpl)
-
-
 def build_job_separator(job_name: str, material: str) -> bytes:
     """Build a ZPL label showing job name on top and material below.
 
