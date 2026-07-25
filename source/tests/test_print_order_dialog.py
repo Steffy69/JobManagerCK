@@ -9,10 +9,6 @@ from __future__ import annotations
 
 # IMPORTANT: this must run before any PyQt import so pytest-qt binds to
 # PyQt5 rather than a concurrently installed PyQt6.
-import os as _os
-
-_os.environ.setdefault("PYTEST_QT_API", "pyqt5")
-
 import os
 import sys
 

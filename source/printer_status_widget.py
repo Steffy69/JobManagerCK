@@ -108,8 +108,14 @@ class PrinterStatusWidget(QWidget):
     # -- lifecycle ---------------------------------------------------------
 
     def start(self) -> None:
-        """Begin polling and run one immediate check."""
-        self._check_status()
+        """Begin polling, seeding with an immediate ASYNC check.
+
+        ``start()`` is called on every busy→idle transition and window
+        restore, not just at startup — a synchronous seed would run
+        ``EnumPrinters`` on the GUI thread at each of those moments, and
+        with a slow spooler that is a multi-second freeze.
+        """
+        self._poll_async()
         self._timer.start(self._poll_interval_ms)
 
     def stop(self) -> None:
@@ -140,9 +146,9 @@ class PrinterStatusWidget(QWidget):
     # -- configuration -----------------------------------------------------
 
     def set_printer_name(self, name: str) -> None:
-        """Update the target printer and re-check immediately."""
+        """Update the target printer and re-check immediately (async)."""
         self._printer_name = name or ""
-        self._check_status()
+        self._poll_async()
 
     def set_poll_interval(self, ms: int) -> None:
         """Update the polling interval. Restarts the timer if it's running."""

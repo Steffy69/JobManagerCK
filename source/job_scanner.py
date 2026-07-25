@@ -23,6 +23,46 @@ SOURCE_DIRS: dict[str, str] = {
 # constant to avoid duplicate literal definitions.
 PRINTED_DIR = r"S:\Jobs\Printed"
 
+# Pre-v2.1 location that PRINTED_DIR replaced.
+ARCHIVE_DIR_LEGACY = r"S:\Jobs\Archive"
+
+
+def migrate_archive_to_printed() -> str | None:
+    """Auto-migrate legacy ``S:\\Jobs\\Archive`` to ``S:\\Jobs\\Printed``.
+
+    Returns a user-facing warning string if manual intervention is required
+    (both folders exist), or ``None`` on success / no-op. Never raises — any
+    unexpected error is logged and returned as a warning so the app can
+    continue to launch.
+    """
+    try:
+        archive_exists = os.path.isdir(ARCHIVE_DIR_LEGACY)
+        printed_exists = os.path.isdir(PRINTED_DIR)
+
+        if archive_exists and not printed_exists:
+            os.rename(ARCHIVE_DIR_LEGACY, PRINTED_DIR)
+            logger.info(
+                "Migrated %s -> %s", ARCHIVE_DIR_LEGACY, PRINTED_DIR
+            )
+            return None
+
+        if archive_exists and printed_exists:
+            warning = (
+                f"Both {ARCHIVE_DIR_LEGACY} and {PRINTED_DIR} exist.\n"
+                "Automatic migration was skipped to avoid overwriting files.\n"
+                "Please review and merge them manually."
+            )
+            logger.warning(warning)
+            return warning
+
+        if not printed_exists:
+            os.makedirs(PRINTED_DIR, exist_ok=True)
+            logger.info("Created %s", PRINTED_DIR)
+        return None
+    except OSError as exc:
+        logger.exception("Archive->Printed migration failed: %s", exc)
+        return f"Could not migrate Archive to Printed: {exc}"
+
 
 @dataclass(frozen=True)
 class Job:

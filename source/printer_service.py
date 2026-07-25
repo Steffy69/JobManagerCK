@@ -11,20 +11,32 @@ raises :class:`PrinterServiceUnavailable`.
 from __future__ import annotations
 
 import logging
-import time
+import os
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 try:
+    import pywintypes  # type: ignore[import-not-found]
     import win32api  # type: ignore[import-not-found]
     import win32print  # type: ignore[import-not-found]
 
     HAS_WIN32 = True
 except ImportError:  # pragma: no cover - exercised via monkeypatching in tests
+    pywintypes = None  # type: ignore[assignment]
     win32api = None  # type: ignore[assignment]
     win32print = None  # type: ignore[assignment]
     HAS_WIN32 = False
+
+#: Marker file recording the user's default printer while a print run has it
+#: temporarily swapped to the Zebra. If the app dies mid-run the marker
+#: survives, and :func:`restore_default_printer_if_marked` puts things back
+#: on the next launch.
+DEFAULT_PRINTER_MARKER = os.path.join(
+    os.path.expanduser("~"), ".jobmanager", "default_printer_backup.txt"
+)
+
+_ERROR_ACCESS_DENIED = 5
 
 
 class PrinterServiceUnavailable(RuntimeError):
@@ -88,18 +100,6 @@ def find_zebra_printer() -> Optional[str]:
     return match_zebra_printer(list_printers())
 
 
-def is_printer_available(printer_name: str) -> bool:
-    """Return True if ``printer_name`` is present in the system printer list.
-
-    Never raises — any exception is caught and treated as unavailable.
-    """
-    try:
-        return printer_name in list_printers()
-    except Exception:  # noqa: BLE001 - contract: must never raise
-        logger.exception("is_printer_available failed for %r", printer_name)
-        return False
-
-
 def get_default_printer() -> Optional[str]:
     """Return the Windows default printer name, or None on error/unavailable."""
     if not HAS_WIN32:
@@ -155,63 +155,144 @@ def print_via_shellexecute(printer_name: str, file_path: str) -> None:
     win32api.ShellExecute(0, "printto", file_path, f'"{printer_name}"', ".", 0)
 
 
-def print_via_default_swap(
-    printer_name: str,
-    file_path: str,
-    settle_seconds: float = 1.5,
-) -> None:
-    """Print ``file_path`` via a temporary Windows-default-printer swap.
+def print_via_print_verb(file_path: str) -> None:
+    """Print ``file_path`` via the plain Windows ``print`` verb.
 
-    Some third-party print handlers (e.g. labelMaker for ``.ljd`` files)
-    reject the ``printto`` verb or mis-parse printer names that contain
-    parentheses or other special characters. This fallback sidesteps the
-    issue by:
-
-    1. Saving the current Windows default printer.
-    2. Setting the default to ``printer_name``.
-    3. Invoking the plain ``print`` verb via ``ShellExecute`` (no printer arg).
-    4. Sleeping ``settle_seconds`` so the handler has time to read the new
-       default before we restore.
-    5. Restoring the previous default in a ``finally`` block — the user's
-       default is never left pointing at the label printer on error.
+    Sends the file to the SYSTEM DEFAULT printer. Used by the label printer's
+    fallback path: some third-party print handlers (e.g. labelMaker for
+    ``.ljd`` files) reject the ``printto`` verb or mis-parse printer names
+    containing parentheses, so the run temporarily makes the Zebra the
+    default and prints with this verb instead. The swap/restore lifecycle is
+    owned by the caller — see :class:`label_printer.LabelPrinterThread` —
+    which swaps ONCE per run rather than per label, so the handler can read
+    the default at any point during the run and still land on the Zebra.
 
     Raises :class:`PrinterServiceUnavailable` if pywin32 is unavailable.
     """
     if not HAS_WIN32:
         raise PrinterServiceUnavailable(
-            "pywin32 is not installed; cannot swap default printer"
+            "pywin32 is not installed; cannot ShellExecute print"
         )
 
-    previous_default: Optional[str] = None
-    try:
-        previous_default = win32print.GetDefaultPrinter()
-    except Exception:  # noqa: BLE001 - non-fatal; we just won't restore
-        logger.exception("GetDefaultPrinter failed while preparing swap")
+    win32api.ShellExecute(0, "print", file_path, None, ".", 0)
 
+
+def set_default_printer(printer_name: str) -> None:
+    """Set the Windows default printer.
+
+    Raises :class:`PrinterServiceUnavailable` if pywin32 is unavailable;
+    other errors propagate so the caller can react (a failed RESTORE of the
+    user's default must be surfaced, not swallowed).
+    """
+    if not HAS_WIN32:
+        raise PrinterServiceUnavailable(
+            "pywin32 is not installed; cannot set default printer"
+        )
     win32print.SetDefaultPrinter(printer_name)
+
+
+def save_default_printer_marker(previous_default: str) -> None:
+    """Persist the pre-swap default printer name to the crash-recovery marker.
+
+    Written immediately BEFORE the swap so that if the process dies while the
+    Zebra is the system default, the next launch can put the user's real
+    default back via :func:`restore_default_printer_if_marked`. An empty
+    string records "there was no default to restore".
+    """
     try:
-        win32api.ShellExecute(0, "print", file_path, None, ".", 0)
-        time.sleep(max(0.0, settle_seconds))
-    finally:
-        if previous_default and previous_default != printer_name:
-            try:
-                win32print.SetDefaultPrinter(previous_default)
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "Failed to restore default printer to %r", previous_default
-                )
+        os.makedirs(os.path.dirname(DEFAULT_PRINTER_MARKER), exist_ok=True)
+        with open(DEFAULT_PRINTER_MARKER, "w", encoding="utf-8") as fh:
+            fh.write(previous_default)
+    except OSError:
+        # The marker is belt-and-braces; a failed write must not stop a
+        # print run. The in-process finally still restores on a clean exit.
+        logger.exception("Could not write default-printer marker")
+
+
+def clear_default_printer_marker() -> None:
+    """Remove the crash-recovery marker after a successful restore."""
+    try:
+        os.remove(DEFAULT_PRINTER_MARKER)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.exception("Could not remove default-printer marker")
+
+
+def restore_default_printer_if_marked() -> Optional[str]:
+    """Undo a default-printer swap that a crashed run left behind.
+
+    Called once at app startup. If the marker file exists, a previous run
+    died between swapping the default to the Zebra and restoring it. Restores
+    the recorded default (when one was recorded) and removes the marker.
+
+    Returns the restored printer name, or None if there was nothing to do.
+    """
+    try:
+        with open(DEFAULT_PRINTER_MARKER, "r", encoding="utf-8") as fh:
+            previous_default = fh.read().strip()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        logger.exception("Could not read default-printer marker")
+        return None
+
+    restored: Optional[str] = None
+    if previous_default and HAS_WIN32:
+        try:
+            win32print.SetDefaultPrinter(previous_default)
+            restored = previous_default
+            logger.info(
+                "Restored default printer to %r after an interrupted print run",
+                previous_default,
+            )
+        except Exception:  # noqa: BLE001 - startup must never crash on this
+            logger.exception(
+                "Could not restore default printer to %r", previous_default
+            )
+            return None  # keep the marker for the next attempt
+
+    clear_default_printer_marker()
+    return restored
+
+
+def _is_access_denied(exc: BaseException) -> bool:
+    """Return True if *exc* is a win32 access-denied error.
+
+    pywin32 raises ``pywintypes.error`` — which is NOT a subclass of Python's
+    ``OSError``/``PermissionError`` — with ``winerror == 5`` for
+    ERROR_ACCESS_DENIED. Catching ``PermissionError`` around a win32 call
+    therefore never fires; this helper is the one place that knows the
+    translation.
+    """
+    if isinstance(exc, PermissionError):
+        return True
+    if pywintypes is not None and isinstance(exc, pywintypes.error):
+        return exc.winerror == _ERROR_ACCESS_DENIED
+    return False
 
 
 def clear_print_queue(printer_name: str) -> int:
     """Delete all queued jobs for ``printer_name``. Returns count deleted.
 
-    Returns 0 if pywin32 is unavailable. Permission errors are re-raised as
-    :class:`PermissionError` with a user-friendly message.
+    Returns 0 if pywin32 is unavailable. Access-denied errors from any of the
+    underlying win32 calls are re-raised as :class:`PermissionError` with a
+    user-friendly message, so the settings dialog's "run as administrator"
+    guidance fires for the real pywin32 exception type.
     """
     if not HAS_WIN32:
         return 0
 
-    hPrinter = win32print.OpenPrinter(printer_name)
+    try:
+        hPrinter = win32print.OpenPrinter(printer_name)
+    except Exception as exc:  # noqa: BLE001 - translate access-denied only
+        if _is_access_denied(exc):
+            raise PermissionError(
+                f"Access denied opening printer {printer_name!r}. "
+                "Try running JobManager as administrator."
+            ) from exc
+        raise
+
     deleted = 0
     try:
         jobs = win32print.EnumJobs(hPrinter, 0, 999, 1)
@@ -222,11 +303,14 @@ def clear_print_queue(printer_name: str) -> int:
                     hPrinter, job_id, 0, None, win32print.JOB_CONTROL_DELETE
                 )
                 deleted += 1
-            except PermissionError as exc:
-                raise PermissionError(
-                    f"Access denied clearing print queue for {printer_name!r}. "
-                    "Try running JobManager as administrator."
-                ) from exc
+            except Exception as exc:  # noqa: BLE001 - translate access-denied
+                if _is_access_denied(exc):
+                    raise PermissionError(
+                        f"Access denied clearing print queue for "
+                        f"{printer_name!r}. "
+                        "Try running JobManager as administrator."
+                    ) from exc
+                raise
     finally:
         win32print.ClosePrinter(hPrinter)
     return deleted

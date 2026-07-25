@@ -97,7 +97,26 @@ class SettingsDialog(QDialog):
         self.print_delay_spinbox.setValue(
             self._initial_settings.print_delay_seconds
         )
-        form.addRow("Delay between prints:", self.print_delay_spinbox)
+        self.print_delay_spinbox.setToolTip(
+            "Pause after each label. Most of a print run's time is this "
+            "delay — try lowering it during a supervised run; if labels "
+            "come out mis-ordered, put it back up."
+        )
+        form.addRow("Delay between labels:", self.print_delay_spinbox)
+
+        self.separator_delay_spinbox = QDoubleSpinBox()
+        self.separator_delay_spinbox.setRange(0.5, 30.0)
+        self.separator_delay_spinbox.setSingleStep(0.5)
+        self.separator_delay_spinbox.setDecimals(1)
+        self.separator_delay_spinbox.setSuffix(" s")
+        self.separator_delay_spinbox.setValue(
+            self._initial_settings.separator_delay_seconds
+        )
+        self.separator_delay_spinbox.setToolTip(
+            "Pause after each separator label. Separators mark the batch "
+            "boundaries between materials — keep this conservative."
+        )
+        form.addRow("Delay after separators:", self.separator_delay_spinbox)
 
         self.print_separators_checkbox = QCheckBox(
             "Print separator labels between materials"
@@ -148,6 +167,9 @@ class SettingsDialog(QDialog):
             self._initial_settings,
             reverse_order=self.reverse_order_checkbox.isChecked(),
             print_delay_seconds=float(self.print_delay_spinbox.value()),
+            separator_delay_seconds=float(
+                self.separator_delay_spinbox.value()
+            ),
             print_separators=self.print_separators_checkbox.isChecked(),
             auto_mark_printed=self.auto_mark_printed_checkbox.isChecked(),
         )

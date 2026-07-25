@@ -6,7 +6,6 @@ Supports Cabinetry Online and Custom Design job workflows.
 
 import logging
 import os
-import shutil
 import sys
 from typing import Optional
 
@@ -19,16 +18,15 @@ except ImportError:  # pragma: no cover - non-Windows hosts (dev boxes, CI)
     winsound = None  # type: ignore[assignment]
 
 from PyQt5 import uic
-from PyQt5.QtCore import QEvent, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QIcon
+from PyQt5.QtCore import QEvent, QTimer, pyqtSignal
+from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import (
     QApplication,
     QDialog,
     QInputDialog,
     QMainWindow,
     QMessageBox,
-    QProgressDialog,
-    QTreeWidgetItem,
+    QPushButton,
 )
 
 import preflight
@@ -37,49 +35,41 @@ import printer_service
 from drop_zone import DropZone
 from file_transfer import FileTransferThread
 from job_scan_worker import JobScanThread
-from job_scanner import PRINTED_DIR, Job, scan_jobs, scan_printed_jobs
-from job_types import JobFiles, JobType, build_display_name, detect_job_type, scan_folder_files
-from label_printer import LabelPrinterThread
-from preflight import (
-    check_cadcode_free_space,
-    check_printer_available,
-    check_s_drive_reachable,
-    check_usb_free_space,
-    estimate_nc_files_size,
+from job_scanner import (
+    PRINTED_DIR,
+    Job,
+    migrate_archive_to_printed,
+    scan_jobs,
+    scan_printed_jobs,
 )
+from job_tree import JobTreeController
+from job_types import (
+    JobType,
+    build_display_name,
+    detect_job_type,
+    scan_folder_files,
+)
+from label_printer import LabelPrinterThread
+from move_job import MoveJobThread
+from preflight import check_cadcode_free_space
 from print_order_dialog import PrintOrderDialog
 from printer_status_widget import PrinterStatusWidget
 from settings import AppSettings, load_settings, save_settings, update_settings
 from settings_dialog import SettingsDialog
-from status_service import NullJobStatusService
 from transfer_history import TransferHistory
-from updater import (
-    CURRENT_VERSION,
-    UpdateChecker,
-    UpdateDownloader,
-    apply_update,
-)
+from update_flow import UpdateFlow
+from updater import CURRENT_VERSION
 from usb_transfer import USBTransferThread, detect_usb_drives
 
 logger = logging.getLogger(__name__)
 
-# Colour constants for job status
-COLOR_READY = QColor(0, 128, 0)              # green — no actions taken
-COLOR_IN_PROGRESS = QColor(0, 0, 200)        # blue — at least one action taken
-COLOR_PRINTED_FINAL = QColor(120, 120, 120)  # grey — moved to Printed folder
-COLOR_DEFAULT = QColor(0, 0, 0)              # black — fallback
-
-SOURCE_FOLDERS = [
-    r"S:\Jobs\Cabinetry Online",
-    r"S:\Jobs\Custom Design",
-]
 DEST_PATH = r"C:\CADCode"
-ARCHIVE_PATH_LEGACY = r"S:\Jobs\Archive"
 PRINTED_PATH = PRINTED_DIR  # re-export for any external callers that import PRINTED_PATH
 AUTO_REFRESH_MS = 5000  # Poll S drive every 5 seconds
 
-# NestLabel integration (placeholder — uncomment and set path when confirmed)
-# NESTLABEL_EXE = r"C:\Program Files\NestLabel\NestLabel.exe"
+# Module-level alias so tests can monkeypatch the migration seam without
+# reaching into job_scanner.
+_migrate_archive_to_printed = migrate_archive_to_printed
 
 
 def _resource_path(filename: str) -> str:
@@ -89,43 +79,6 @@ def _resource_path(filename: str) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
 
 
-def _migrate_archive_to_printed() -> Optional[str]:
-    """Auto-migrate legacy ``S:\\Jobs\\Archive`` to ``S:\\Jobs\\Printed``.
-
-    Returns a user-facing warning string if manual intervention is required
-    (both folders exist), or ``None`` on success / no-op. Never raises — any
-    unexpected error is logged and returned as a warning so the app can
-    continue to launch.
-    """
-    try:
-        archive_exists = os.path.isdir(ARCHIVE_PATH_LEGACY)
-        printed_exists = os.path.isdir(PRINTED_PATH)
-
-        if archive_exists and not printed_exists:
-            os.rename(ARCHIVE_PATH_LEGACY, PRINTED_PATH)
-            logger.info(
-                "Migrated %s -> %s", ARCHIVE_PATH_LEGACY, PRINTED_PATH
-            )
-            return None
-
-        if archive_exists and printed_exists:
-            warning = (
-                f"Both {ARCHIVE_PATH_LEGACY} and {PRINTED_PATH} exist.\n"
-                "Automatic migration was skipped to avoid overwriting files.\n"
-                "Please review and merge them manually."
-            )
-            logger.warning(warning)
-            return warning
-
-        if not printed_exists:
-            os.makedirs(PRINTED_PATH, exist_ok=True)
-            logger.info("Created %s", PRINTED_PATH)
-        return None
-    except OSError as exc:
-        logger.exception("Archive->Printed migration failed: %s", exc)
-        return f"Could not migrate Archive to Printed: {exc}"
-
-
 def _beep(success: bool) -> None:
     """Play the OK / error system sound, if the platform provides one."""
     if winsound is None:
@@ -133,20 +86,6 @@ def _beep(success: bool) -> None:
     winsound.MessageBeep(
         winsound.MB_OK if success else winsound.MB_ICONHAND
     )
-
-
-def _build_tooltip(files: JobFiles) -> str:
-    """Build a tooltip string showing file counts for a job."""
-    parts: list[str] = []
-    if files.nc_files:
-        parts.append(f"{len(files.nc_files)} NC files")
-    if files.mdb_files:
-        parts.append(f"{len(files.mdb_files)} MDB files")
-    if files.wmf_files:
-        parts.append(f"{len(files.wmf_files)} WMF files")
-    if files.ljd_files:
-        parts.append(f"{len(files.ljd_files)} LJD files")
-    return ", ".join(parts) if parts else "No recognised files"
 
 
 class JobManager(QMainWindow):
@@ -174,23 +113,32 @@ class JobManager(QMainWindow):
 
         # Data stores
         self._history = TransferHistory()
-        self._status_service = NullJobStatusService()
         self._active_jobs: list[Job] = []
         self._printed_jobs: list[Job] = []
         self._dropped_jobs: dict[str, Job] = {}
 
-        # Tree roots — populated in _populate_tree; kept on self so
-        # _refresh_preserving_selection can walk children without rebuilding.
-        self._active_root: Optional[QTreeWidgetItem] = None
-        self._printed_root: Optional[QTreeWidgetItem] = None
+        # Tree management (rows, colours, rebuild-skipping, selection
+        # preservation) lives in its own controller.
+        self._tree = JobTreeController(
+            self.jobTreeWidget,
+            self._history,
+            on_rebuilt=self._on_selection_changed,
+        )
 
-        # Identifies what the tree currently displays. A refresh whose result
-        # matches this skips the rebuild entirely, which is the common case —
-        # job folders change rarely, but the refresh timer fires constantly.
-        self._last_tree_signature: Optional[tuple] = None
+        # Update check/download/apply flow.
+        self._updates = UpdateFlow(self, self.statusbar)
 
         # In-flight background scan, if any.
         self._scan_thread: Optional[JobScanThread] = None
+
+        # The one long operation allowed at a time (transfer / print / USB
+        # copy / folder move). While it runs, self._busy is True and every
+        # path that could start another operation — or re-enable the buttons
+        # that start one — is gated on it. Rebinding _active_thread while a
+        # thread is running would drop the only reference to a live QThread
+        # and crash the app, so the gate is load-bearing, not cosmetic.
+        self._busy = False
+        self._active_thread = None
 
         # Printer status tracked via PrinterStatusWidget; assume offline
         # until the first poll reports otherwise. This is consulted by
@@ -200,7 +148,6 @@ class JobManager(QMainWindow):
         self._printer_status: Optional[PrinterStatusWidget] = None
 
         # Paths
-        self._source_folders = SOURCE_FOLDERS
         self._dest_path = DEST_PATH
 
         self._migration_warning: Optional[str] = None
@@ -208,6 +155,7 @@ class JobManager(QMainWindow):
         # Drop zone
         self._drop_zone = DropZone()
         self._drop_zone.fileDropped.connect(self._handle_dropped_folder)
+        self._drop_zone.dropRejected.connect(self.statusbar.showMessage)
         self.centralwidget.layout().insertWidget(2, self._drop_zone)
 
         self._setup_ui()
@@ -226,10 +174,26 @@ class JobManager(QMainWindow):
         self._refresh_timer.timeout.connect(self._auto_refresh)
         self._refresh_timer.start(AUTO_REFRESH_MS)
 
-        QTimer.singleShot(2000, self._check_for_updates)
+        QTimer.singleShot(2000, lambda: self._updates.check(force=False))
 
     def _run_migration(self) -> None:
-        """Run the one-shot Archive -> Printed migration and report problems."""
+        """Deferred startup housekeeping (off the pre-show path).
+
+        Restores the Windows default printer if a previous run died while it
+        was swapped to the Zebra, then runs the one-shot Archive -> Printed
+        migration.
+        """
+        try:
+            restored = printer_service.restore_default_printer_if_marked()
+        except Exception:  # noqa: BLE001 - never block startup on this
+            logger.exception("Default-printer recovery failed")
+            restored = None
+        if restored:
+            self.statusbar.showMessage(
+                f"Restored the default printer to {restored} after an "
+                "interrupted print run"
+            )
+
         self._migration_warning = _migrate_archive_to_printed()
         if self._migration_warning:
             QMessageBox.warning(
@@ -259,15 +223,27 @@ class JobManager(QMainWindow):
         # Disable action buttons until a job is selected
         self._set_action_buttons_enabled(False)
 
+        # Cancel button for long operations — lives in the status bar and
+        # only appears while an operation is running. Without it, a 2-minute
+        # print of the wrong job could only be stopped by killing the app.
+        self._cancel_button = QPushButton("Cancel")
+        self._cancel_button.setVisible(False)
+        self._cancel_button.clicked.connect(self._cancel_active_operation)
+        self.statusbar.addPermanentWidget(self._cancel_button)
+
         # Settings menu — Print Settings dialog for material priority,
         # print behaviour toggles, and troubleshooting actions.
         settings_menu = self.menuBar().addMenu("&Settings")
         settings_action = settings_menu.addAction("Print Settings...")
         settings_action.triggered.connect(self._on_settings_triggered)
 
-        # Help menu
+        # Help menu. The lambda matters: QAction.triggered passes a checked
+        # bool that would otherwise land in the force parameter.
         help_menu = self.menuBar().addMenu("Help")
-        help_menu.addAction("Check for Updates", self._check_for_updates)
+        help_menu.addAction(
+            "Check for Updates",
+            lambda: self._updates.check(force=True),
+        )
         help_menu.addAction("About", self._show_about)
 
         self.statusbar.showMessage("Ready")
@@ -336,20 +312,56 @@ class JobManager(QMainWindow):
     def _set_ui_busy(self, busy: bool) -> None:
         """Disable or re-enable the full UI during long operations.
 
-        Also parks the background polls. While a transfer or print is
-        running they compete with the worker for the same S: share and print
-        spooler, and their results cannot be acted on anyway because the
-        controls they feed are disabled.
+        EVERY control that can start (or feed into) another operation is
+        gated: buttons, tree, drop zone and menu bar. Leaving any of them
+        live lets a second operation rebind ``_active_thread`` and destroy
+        the still-running first thread. The background polls are parked too
+        — they compete with the worker for the same S: share and print
+        spooler.
         """
+        self._busy = busy
         enabled = not busy
         self.refreshButton.setEnabled(enabled)
         self.jobTreeWidget.setEnabled(enabled)
-        self._set_action_buttons_enabled(enabled)
         self.restoreButton.setEnabled(enabled)
-        self._set_polling_active(enabled)
+        self._drop_zone.setEnabled(enabled)
+        self.menuBar().setEnabled(enabled)
+        self._cancel_button.setVisible(busy)
+        self._cancel_button.setEnabled(busy)
 
-    def _set_polling_active(self, active: bool) -> None:
-        """Start or stop the job-refresh and printer-status polls."""
+        if busy:
+            self._set_action_buttons_enabled(False)
+        else:
+            self._active_thread = None
+            # Re-validate rather than blanket-enable: a blanket enable would
+            # e.g. light up Print Labels for a job with no label files.
+            self._on_selection_changed()
+            # Catch up on anything that changed on disk while we were busy —
+            # scan results that arrived mid-operation were discarded.
+            self.refresh_jobs()
+
+        self._sync_polling()
+
+    def _cancel_active_operation(self) -> None:
+        """Ask the running worker to stop at its next checkpoint."""
+        thread = self._active_thread
+        if thread is not None and thread.isRunning():
+            thread.requestInterruption()
+            self._cancel_button.setEnabled(False)
+            self.statusbar.showMessage("Cancelling...")
+
+    def _sync_polling(self) -> None:
+        """Start/stop the background polls from ONE combined predicate.
+
+        Busy and minimised each previously toggled polling independently,
+        last writer wins — so restoring the window mid-print restarted the
+        polls, and finishing an operation while minimised restarted them
+        into a hidden window. One predicate cannot fight itself.
+        """
+        active = not getattr(self, "_busy", False) and not self.isMinimized()
+
+        # getattr: Qt can deliver events during uic.loadUi, before __init__
+        # has finished assigning our own attributes.
         timer = getattr(self, "_refresh_timer", None)
         if timer is not None:
             if active and not timer.isActive():
@@ -357,8 +369,6 @@ class JobManager(QMainWindow):
             elif not active and timer.isActive():
                 timer.stop()
 
-        # getattr: Qt can deliver events during uic.loadUi, before __init__
-        # has finished assigning our own attributes.
         status_widget = getattr(self, "_printer_status", None)
         if status_widget is not None:
             try:
@@ -370,14 +380,14 @@ class JobManager(QMainWindow):
                 logger.exception("Failed to toggle printer status polling")
 
     def changeEvent(self, event) -> None:  # noqa: N802 - Qt override
-        """Pause polling while the window is minimised.
+        """Re-evaluate polling when the window is minimised or restored.
 
         Minimised means nothing the polls produce can be seen, but the scans
         would still hammer the S: share and the print spooler all shift.
         """
         super().changeEvent(event)
         if event.type() == QEvent.WindowStateChange:
-            self._set_polling_active(not self.isMinimized())
+            self._sync_polling()
 
     # -- Auto-refresh --
 
@@ -409,6 +419,10 @@ class JobManager(QMainWindow):
         deliver fresh results momentarily, and queueing another would only
         add load to the share.
         """
+        if self._busy:
+            # The refresh timer is parked while busy, but a stray call must
+            # not add S: load or rebuild the tree under a running operation.
+            return
         if self._scan_thread is not None and self._scan_thread.isRunning():
             return
 
@@ -447,9 +461,32 @@ class JobManager(QMainWindow):
 
     def _on_scan_finished(self, active: list, printed: list) -> None:
         """Apply scan results from the worker thread to the tree."""
+        if self._busy:
+            # A scan that started before the operation must not rebuild the
+            # tree now: _populate_tree ends by re-validating the action
+            # buttons, which would re-enable them mid-print — the exact hole
+            # the busy lockout exists to close. _set_ui_busy(False) refreshes
+            # again, so nothing is lost.
+            self.jobsRefreshed.emit()
+            return
+
+        # Prune dropped jobs whose folder has since been deleted — they can
+        # never be acted on, and re-adding them each scan made them
+        # immortal. Dropped jobs are rare, so these stats are cheap.
+        for name in [
+            n for n, j in self._dropped_jobs.items()
+            if not os.path.isdir(j.path)
+        ]:
+            del self._dropped_jobs[name]
+
         self._active_jobs = list(active)
-        # Re-add dropped jobs (treat as active).
-        self._active_jobs.extend(self._dropped_jobs.values())
+        # Re-add dropped jobs (treat as active), unless a job of the same
+        # name was scanned from S: — a folder dropped from S:\Jobs itself
+        # would otherwise appear twice, forever.
+        scanned_names = {j.name for j in self._active_jobs}
+        self._active_jobs.extend(
+            j for n, j in self._dropped_jobs.items() if n not in scanned_names
+        )
         self._printed_jobs = list(printed)
 
         changed = self._populate_tree()
@@ -470,172 +507,26 @@ class JobManager(QMainWindow):
 
         self.jobsRefreshed.emit()
 
-    def _tree_signature(self, statuses: dict[str, str]) -> tuple:
-        """Return a value identifying exactly what the tree should display.
-
-        ``Job`` and ``JobFiles`` are frozen dataclasses, so comparing them
-        compares every rendered field. Statuses are folded in because they
-        drive the row colour. If this is unchanged since the last rebuild,
-        the tree is already correct and rebuilding it would only cost the
-        user their scroll position and expansion state.
-        """
-        return (
-            tuple(self._active_jobs),
-            tuple(self._printed_jobs),
-            tuple(statuses.get(j.name, "Ready") for j in self._active_jobs),
-        )
-
     def _populate_tree(self) -> bool:
-        """Fill the QTreeWidget with two roots: Active Jobs + Printed Jobs.
+        """Repaint the tree from the current job lists (via the controller).
 
-        Returns True if the tree was rebuilt, False if it was already showing
-        exactly this content and the rebuild was skipped.
+        Returns True if the tree was rebuilt, False if the rebuild was
+        skipped because nothing changed.
         """
-        # One read of the history file for the whole tree, rather than one
-        # read per job.
-        statuses = self._history.get_all_statuses()
-
-        signature = self._tree_signature(statuses)
-        if signature == self._last_tree_signature:
-            return False
-
-        tree = self.jobTreeWidget
-
-        # Remember the user's place so a background refresh doesn't move it.
-        selected = self._selected_job()
-        selection_key: Optional[tuple[str, bool]] = (
-            (selected.name, selected.is_printed) if selected is not None else None
-        )
-        first_build = self._last_tree_signature is None
-        if first_build:
-            active_expanded, printed_expanded = True, False
-        else:
-            active_expanded = (
-                self._active_root.isExpanded()
-                if self._active_root is not None else True
-            )
-            printed_expanded = (
-                self._printed_root.isExpanded()
-                if self._printed_root is not None else False
-            )
-        scroll_value = tree.verticalScrollBar().value()
-
-        # Suppress painting and selection signals for the whole rebuild:
-        # clear() and each addChild() would otherwise trigger layout work and
-        # re-entrant selection handling per item.
-        tree.setUpdatesEnabled(False)
-        blocked = tree.blockSignals(True)
-        try:
-            tree.clear()
-
-            active_root = QTreeWidgetItem(["Active Jobs"])
-            printed_root = QTreeWidgetItem(
-                [f"Printed Jobs ({len(self._printed_jobs)})"]
-            )
-
-            tree.addTopLevelItem(active_root)
-            tree.addTopLevelItem(printed_root)
-
-            for job in self._active_jobs:
-                active_root.addChild(self._build_job_item(job, statuses))
-
-            for job in self._printed_jobs:
-                item = self._build_job_item(job, statuses)
-                # Printed jobs always wear the grey colour, regardless of what
-                # the history file says — they were explicitly moved out of
-                # Active.
-                item.setForeground(0, COLOR_PRINTED_FINAL)
-                printed_root.addChild(item)
-
-            active_root.setExpanded(active_expanded)
-            printed_root.setExpanded(printed_expanded)
-
-            self._active_root = active_root
-            self._printed_root = printed_root
-
-            self._restore_selection(selection_key)
-            tree.verticalScrollBar().setValue(scroll_value)
-        finally:
-            tree.blockSignals(blocked)
-            tree.setUpdatesEnabled(True)
-
-        self._last_tree_signature = signature
-        # Signals were blocked during the rebuild, so drive the selection
-        # handler once by hand to bring the buttons back in sync.
-        self._on_selection_changed()
-        return True
-
-    def _restore_selection(self, key: Optional[tuple[str, bool]]) -> None:
-        """Re-select the job identified by *key* after a rebuild.
-
-        The key is ``(job.name, is_printed)`` so a job present in both the
-        Active and Printed trees (shouldn't happen in practice, but safe) is
-        re-selected in the same tree it was chosen from. A job that no longer
-        exists clears the selection cleanly.
-        """
-        if key is None:
-            return
-
-        target_name, target_is_printed = key
-        root = self._printed_root if target_is_printed else self._active_root
-        if root is not None:
-            for i in range(root.childCount()):
-                child = root.child(i)
-                job = child.data(0, Qt.UserRole)
-                if isinstance(job, Job) and job.name == target_name:
-                    # A restored selection inside a collapsed root would be
-                    # invisible — make sure the user can see it.
-                    root.setExpanded(True)
-                    self.jobTreeWidget.setCurrentItem(child)
-                    return
-
-        self.jobTreeWidget.setCurrentItem(None)
-
-    def _build_job_item(
-        self, job: Job, statuses: dict[str, str]
-    ) -> QTreeWidgetItem:
-        """Create a QTreeWidgetItem for a Job with label, tooltip, and colour.
-
-        *statuses* is the pre-read ``{job_name: status}`` map from
-        :meth:`TransferHistory.get_all_statuses`, so building a row costs no
-        file I/O.
-        """
-        tag = "CO" if job.job_type == JobType.CABINETRY_ONLINE else "CD"
-        label = f"[{tag}] {job.display_name or job.name}"
-        item = QTreeWidgetItem([label])
-        item.setData(0, Qt.UserRole, job)
-        item.setToolTip(0, _build_tooltip(job.files))
-
-        status = statuses.get(job.name, "Ready")
-        if status == "Ready":
-            item.setForeground(0, COLOR_READY)
-        elif status == "In Progress":
-            item.setForeground(0, COLOR_IN_PROGRESS)
-        elif status == "Printed":
-            item.setForeground(0, COLOR_PRINTED_FINAL)
-        else:
-            item.setForeground(0, COLOR_DEFAULT)
-        return item
+        return self._tree.populate(self._active_jobs, self._printed_jobs)
 
     # -- Selection --
 
     def _selected_job(self) -> Optional[Job]:
-        """Return the currently selected Job, or None.
-
-        Returns None if no item is selected or if a root header is selected.
-        """
-        item = self.jobTreeWidget.currentItem()
-        if item is None:
-            return None
-        # Root items (Active Jobs / Printed Jobs) have no parent.
-        if item.parent() is None:
-            return None
-        data = item.data(0, Qt.UserRole)
-        if isinstance(data, Job):
-            return data
-        return None
+        """Return the currently selected Job, or None."""
+        return self._tree.selected_job()
 
     def _on_selection_changed(self) -> None:
+        if self._busy:
+            # Nothing may re-enable the action buttons while an operation
+            # runs — starting a second one would rebind _active_thread and
+            # destroy the live thread.
+            return
         job = self._selected_job()
         if job is None:
             self._set_action_buttons_enabled(False)
@@ -680,27 +571,12 @@ class JobManager(QMainWindow):
         job = self._selected_job()
         if job is None:
             return
-        if os.path.isdir(job.path):
+        # No pre-stat: probing an S: path on the GUI thread hangs on a dead
+        # share. startfile fails fast with the same information.
+        try:
             os.startfile(job.path)
-        else:
+        except OSError:
             self.statusbar.showMessage(f"Folder not found: {job.path}")
-
-    # -- NestLabel integration (placeholder) --
-
-    # def _open_in_nestlabel(self) -> None:
-    #     """Launch NestLabel with the selected CO job's .mdb file."""
-    #     job = self._selected_job()
-    #     if job is None or not job.files.mdb_files:
-    #         return
-    #     mdb_path = job.files.mdb_files[0]
-    #     nestlabel_exe = NESTLABEL_EXE
-    #     if not os.path.exists(nestlabel_exe):
-    #         QMessageBox.warning(self, "NestLabel Not Found",
-    #                             f"NestLabel not found at:\n{nestlabel_exe}")
-    #         return
-    #     import subprocess
-    #     subprocess.Popen([nestlabel_exe, mdb_path])
-    #     self.statusbar.showMessage(f"Opened NestLabel: {os.path.basename(mdb_path)}")
 
     # -- Preflight helpers --
 
@@ -714,14 +590,13 @@ class JobManager(QMainWindow):
 
     def _transfer_files(self) -> None:
         job = self._selected_job()
-        if job is None:
+        if job is None or self._busy:
             return
 
-        # Silent preflight: no dialog on pass, warning + abort on fail.
-        s_result = check_s_drive_reachable(r"S:\Jobs")
-        if not s_result.ok:
-            self._show_preflight_failure(s_result)
-            return
+        # CADCode free space is a local, bounded check — fine inline. The
+        # S:-drive reachability probe moved into the worker: an SMB probe
+        # has unbounded latency exactly when the share is sick, and here it
+        # would freeze the GUI instead of showing the failure dialog.
         cad_result = check_cadcode_free_space(self._dest_path, min_mb=500)
         if not cad_result.ok:
             self._show_preflight_failure(cad_result)
@@ -735,7 +610,9 @@ class JobManager(QMainWindow):
         )
         self._active_thread.progress.connect(self._update_status)
         self._active_thread.finished.connect(
-            lambda ok, msg: self._on_operation_finished(ok, msg, "transferred", job.name, job.job_type.name)
+            lambda ok, msg, j=job: self._on_operation_finished(
+                ok, msg, "transferred", j
+            )
         )
         self._active_thread.start()
 
@@ -743,7 +620,7 @@ class JobManager(QMainWindow):
 
     def _print_labels(self) -> None:
         job = self._selected_job()
-        if job is None:
+        if job is None or self._busy:
             return
 
         if not job.files.ljd_files:
@@ -754,15 +631,12 @@ class JobManager(QMainWindow):
             )
             return
 
-        # Preflight: S drive (ljd paths live there) + Zebra printer.
-        s_result = check_s_drive_reachable(r"S:\Jobs")
-        if not s_result.ok:
-            self._show_preflight_failure(s_result)
-            return
-        printer_result = check_printer_available(self._settings.zebra_printer_name)
-        if not printer_result.ok:
-            self._show_preflight_failure(printer_result)
-            return
+        # Printer availability comes from the status widget's background
+        # poll (self._zebra_online gates the Print button already) — the old
+        # inline EnumPrinters preflight re-enumerated the spooler on the GUI
+        # thread on every click, freezing the window whenever the spooler
+        # was slow. S:-drive reachability is the worker's problem: a label
+        # that fails to submit surfaces a real error there.
 
         # Resolve the actual printer name: user override wins, then the name
         # the status widget already resolved on its last poll, and only as a
@@ -849,7 +723,9 @@ class JobManager(QMainWindow):
         )
         self._active_thread.progress.connect(self._on_print_progress)
         self._active_thread.finished.connect(
-            lambda ok, msg: self._on_operation_finished(ok, msg, "printed", job.name, job.job_type.name)
+            lambda ok, msg, j=job: self._on_operation_finished(
+                ok, msg, "printed", j
+            )
         )
         self._active_thread.start()
 
@@ -864,7 +740,7 @@ class JobManager(QMainWindow):
 
     def _copy_nc_to_usb(self) -> None:
         job = self._selected_job()
-        if job is None:
+        if job is None or self._busy:
             return
 
         drives = detect_usb_drives()
@@ -882,16 +758,9 @@ class JobManager(QMainWindow):
                 return
             target_drive = drive
 
-        # USB drive preflight: make sure the target has room for every NC
-        # file we're about to copy, with a 1 MB safety buffer.
-        usb_path = f"{target_drive}\\"
-        required_bytes = estimate_nc_files_size(job.files.nc_files)
-        required_mb = (required_bytes // (1024 * 1024)) + 1
-        usb_result = check_usb_free_space(usb_path, required_mb=required_mb)
-        if not usb_result.ok:
-            self._show_preflight_failure(usb_result)
-            return
-
+        # Size estimation and the free-space check happen inside the worker
+        # now — sizing every NC file is one SMB stat per file, which used to
+        # run on the GUI thread before the dialog could even appear.
         self._set_ui_busy(True)
         self._active_thread = USBTransferThread(
             nc_files=job.files.nc_files,
@@ -899,7 +768,9 @@ class JobManager(QMainWindow):
         )
         self._active_thread.progress.connect(self._update_status)
         self._active_thread.finished.connect(
-            lambda ok, msg: self._on_operation_finished(ok, msg, "nc_copied", job.name, job.job_type.name)
+            lambda ok, msg, j=job: self._on_operation_finished(
+                ok, msg, "nc_copied", j
+            )
         )
         self._active_thread.start()
 
@@ -907,7 +778,7 @@ class JobManager(QMainWindow):
 
     def _move_to_printed(self) -> None:
         job = self._selected_job()
-        if job is None:
+        if job is None or self._busy:
             return
         if job.is_printed:
             # Safety: can't re-move an already-printed job.
@@ -922,22 +793,37 @@ class JobManager(QMainWindow):
         if reply != QMessageBox.Yes:
             return
 
-        try:
-            os.makedirs(PRINTED_PATH, exist_ok=True)
-            printed_dest = os.path.join(PRINTED_PATH, job.name)
-            shutil.move(job.path, printed_dest)
-            self._history.mark_moved_to_printed(job.name, job.job_type.name)
-            logger.info("Moved job %s to %s", job.name, printed_dest)
-        except Exception:
-            logger.exception("Failed to move job %s to Printed", job.name)
-            QMessageBox.critical(
-                self, "Error", f"Could not move job to Printed: {job.name}"
-            )
-            return
+        self._start_move_to_printed(job)
 
-        # Remove dropped reference if present
-        self._dropped_jobs.pop(job.name, None)
-        self._refresh_preserving_selection()
+    def _start_move_to_printed(self, job: Job) -> None:
+        """Move *job* into the Printed folder on a worker thread.
+
+        A move on the same S: volume is a single rename, but a DROPPED job
+        can live anywhere and ``shutil.move`` silently degrades to a full
+        copy over the network — minutes of frozen GUI if run inline.
+        """
+        self._set_ui_busy(True)
+        dest = os.path.join(PRINTED_PATH, job.name)
+        self._active_thread = MoveJobThread(src=job.path, dest=dest)
+        self._active_thread.finished.connect(
+            lambda ok, msg, j=job: self._on_move_to_printed_finished(
+                ok, msg, j
+            )
+        )
+        self._active_thread.start()
+        self.statusbar.showMessage(f"Moving {job.name} to Printed...")
+
+    def _on_move_to_printed_finished(
+        self, success: bool, message: str, job: Job
+    ) -> None:
+        if success:
+            self._history.mark_moved_to_printed(job.name, job.job_type.name)
+            self._dropped_jobs.pop(job.name, None)
+            self._set_ui_busy(False)
+            self.statusbar.showMessage(f"Moved {job.name} to Printed")
+        else:
+            self._set_ui_busy(False)
+            QMessageBox.critical(self, "Move to Printed Failed", message)
 
     # -- Restore from Printed --
 
@@ -950,41 +836,40 @@ class JobManager(QMainWindow):
             3. No recognised files -> ask the user
         """
         job = self._selected_job()
-        if job is None or not job.is_printed:
+        if job is None or not job.is_printed or self._busy:
             return
 
         source_type = self._detect_restore_target(job)
         if source_type is None:
             return  # User cancelled the picker.
 
-        target_base = os.path.join(r"S:\Jobs", source_type)
-        target_path = os.path.join(target_base, job.name)
+        target_path = os.path.join(r"S:\Jobs", source_type, job.name)
 
-        if os.path.exists(target_path):
-            QMessageBox.critical(
-                self,
-                "Restore Failed",
-                f"A job named '{job.name}' already exists at:\n{target_path}\n\n"
-                "Rename or remove the existing folder before restoring.",
+        # The destination-exists check happens inside the worker — it is an
+        # SMB round-trip, and MoveJobThread refuses to merge into an
+        # existing folder anyway.
+        self._set_ui_busy(True)
+        self._active_thread = MoveJobThread(src=job.path, dest=target_path)
+        self._active_thread.finished.connect(
+            lambda ok, msg, j=job, st=source_type: (
+                self._on_restore_finished(ok, msg, j, st)
             )
-            return
+        )
+        self._active_thread.start()
+        self.statusbar.showMessage(f"Restoring {job.name}...")
 
-        try:
-            os.makedirs(target_base, exist_ok=True)
-            shutil.move(job.path, target_path)
+    def _on_restore_finished(
+        self, success: bool, message: str, job: Job, source_type: str
+    ) -> None:
+        if success:
             self._history.clear_moved_to_printed(job.name)
-            logger.info("Restored %s from Printed to %s", job.name, target_path)
-        except Exception:
-            logger.exception("Failed to restore %s to %s", job.name, target_path)
-            QMessageBox.critical(
-                self,
-                "Restore Failed",
-                f"Could not restore '{job.name}' to {source_type}.",
+            self._set_ui_busy(False)
+            self.statusbar.showMessage(
+                f"Restored {job.name} to {source_type}"
             )
-            return
-
-        self.statusbar.showMessage(f"Restored {job.name} to {source_type}")
-        self._refresh_preserving_selection()
+        else:
+            self._set_ui_busy(False)
+            QMessageBox.critical(self, "Restore Failed", message)
 
     def _detect_restore_target(self, job: Job) -> Optional[str]:
         """Decide which source folder a printed job should be restored to.
@@ -1018,31 +903,49 @@ class JobManager(QMainWindow):
         self.statusbar.showMessage(message)
 
     def _on_operation_finished(
-        self, success: bool, message: str, history_action: str,
-        job_name: str, job_type_name: str,
+        self, success: bool, message: str, history_action: str, job: Job,
     ) -> None:
-        self._set_ui_busy(False)
-
         if success:
+            # Record history BEFORE _set_ui_busy(False): un-busying kicks a
+            # refresh, and the tree should paint the new status first time.
             if history_action == "transferred":
-                self._history.mark_transferred(job_name, job_type_name)
+                self._history.mark_transferred(job.name, job.job_type.name)
             elif history_action == "printed":
-                self._history.mark_printed(job_name, job_type_name)
+                self._history.mark_printed(job.name, job.job_type.name)
             elif history_action == "nc_copied":
-                self._history.mark_nc_copied(job_name, job_type_name)
+                self._history.mark_nc_copied(job.name, job.job_type.name)
+
+            self._set_ui_busy(False)
+            self.statusbar.showMessage("Ready")
             _beep(True)
             QMessageBox.information(self, "Success", message)
-            self._refresh_preserving_selection()
+
+            # Optional workflow shortcut: a job whose labels just printed
+            # goes straight to the Printed folder without the confirm
+            # dialog. (This setting existed in the UI for a while without
+            # being wired to anything.)
+            if (
+                history_action == "printed"
+                and self._settings.auto_mark_printed
+                and not job.is_printed
+            ):
+                self._start_move_to_printed(job)
         else:
+            self._set_ui_busy(False)
+            self.statusbar.showMessage("Ready")
             _beep(False)
             QMessageBox.critical(self, "Error", message)
-
-        self.statusbar.showMessage("Ready")
 
     # -- Drop zone --
 
     def _handle_dropped_folder(self, path: str) -> None:
         """Process a folder dropped onto the drop zone."""
+        if self._busy:
+            self.statusbar.showMessage(
+                "Busy — drop the folder again after the current operation "
+                "finishes"
+            )
+            return
         try:
             files = scan_folder_files(path)
             job_type = detect_job_type(files)
@@ -1060,86 +963,16 @@ class JobManager(QMainWindow):
 
         # The dropped job is fully scanned already — add it to the tree
         # directly rather than re-walking the whole S: share to rediscover
-        # something we're holding in hand.
-        if job not in self._active_jobs:
-            self._active_jobs.append(job)
+        # something we're holding in hand. Dedupe by NAME: full dataclass
+        # equality never matches a scanned copy of the same folder (its
+        # source_folder differs), which used to double the row forever.
+        self._active_jobs = [
+            j for j in self._active_jobs if j.name != name
+        ]
+        self._active_jobs.append(job)
         self._populate_tree()
-
-        # Select the dropped job under the Active root.
-        if self._active_root is not None:
-            for i in range(self._active_root.childCount()):
-                child = self._active_root.child(i)
-                child_job = child.data(0, Qt.UserRole)
-                if isinstance(child_job, Job) and child_job.name == name:
-                    self._active_root.setExpanded(True)
-                    self.jobTreeWidget.setCurrentItem(child)
-                    break
-
+        self._tree.select_job_by_name(name)
         self.statusbar.showMessage(f"Added dropped job: {name}")
-
-    # -- Update system --
-
-    def _check_for_updates(self) -> None:
-        # Rebinding _update_checker while a check is in flight would drop the
-        # only reference to a running QThread and PyQt would destroy it
-        # mid-run. The Help menu item and the start-up check share this path.
-        existing = getattr(self, "_update_checker", None)
-        if existing is not None and existing.isRunning():
-            return
-
-        self.statusbar.showMessage("Checking for updates...")
-        self._update_checker = UpdateChecker()
-        self._update_checker.update_available.connect(self._handle_update_available)
-        self._update_checker.error.connect(
-            lambda msg: self.statusbar.showMessage("Could not check for updates"),
-        )
-        self._update_checker.start()
-
-    def _handle_update_available(self, info: dict) -> None:
-        self.statusbar.showMessage("Update available!")
-        self._pending_update_info = info
-        notes = info.get("release_notes") or "No release notes available."
-        reply = QMessageBox.question(
-            self,
-            "Update Available",
-            f"Version {info['version']} is available!\n\n"
-            f"Release notes:\n{notes}\n\n"
-            "Would you like to download and install it?",
-            QMessageBox.Yes | QMessageBox.No,
-        )
-        if reply == QMessageBox.Yes:
-            self._download_update(info)
-
-    def _download_update(self, info: dict) -> None:
-        progress = QProgressDialog("Downloading update...", "Cancel", 0, 100, self)
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setAutoClose(False)
-
-        self._downloader = UpdateDownloader(
-            download_url=info.get("download_url", ""),
-        )
-        self._downloader.progress.connect(progress.setValue)
-        self._downloader.finished.connect(
-            lambda ok, result: self._handle_download_finished(ok, result, progress),
-        )
-        self._downloader.start()
-
-    def _handle_download_finished(
-        self, success: bool, result: str, progress_dialog: QProgressDialog,
-    ) -> None:
-        progress_dialog.close()
-        if success:
-            reply = QMessageBox.question(
-                self,
-                "Update Downloaded",
-                "Update downloaded successfully!\n\n"
-                "The application will now restart to apply the update.",
-                QMessageBox.Ok | QMessageBox.Cancel,
-            )
-            if reply == QMessageBox.Ok:
-                apply_update(result)
-        else:
-            QMessageBox.critical(self, "Download Failed", f"Failed to download update:\n{result}")
 
     # -- Settings dialog --
 
@@ -1189,7 +1022,32 @@ class JobManager(QMainWindow):
     # -- Window lifecycle ------------------------------------------------
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
-        """Stop all polling and tear background work down cleanly."""
+        """Stop all polling and tear background work down cleanly.
+
+        The running-operation check comes FIRST: if the user keeps the app
+        open, nothing must have been torn down yet. Closing with a live
+        QThread aborts the process at interpreter teardown — and if the
+        print thread dies inside its default-printer swap, the system
+        default is left pointing at the Zebra.
+        """
+        active = self._active_thread
+        if active is not None and active.isRunning():
+            reply = QMessageBox.question(
+                self,
+                "Operation in Progress",
+                "A transfer or print is still running.\n\n"
+                "Cancel it and exit?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                event.ignore()
+                return
+            active.requestInterruption()
+            if not active.wait(15000):
+                logger.error("Active worker did not stop within 15s")
+
+        self._updates.shutdown()
+
         timer = getattr(self, "_refresh_timer", None)
         if timer is not None:
             timer.stop()
@@ -1218,7 +1076,10 @@ class JobManager(QMainWindow):
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    from app_logging import setup_logging
+
+    setup_logging()
+    logger.info("Job Manager CK v%s starting", CURRENT_VERSION)
     app = QApplication(sys.argv)
     window = JobManager()
     window.show()

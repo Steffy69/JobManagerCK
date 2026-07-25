@@ -4,12 +4,9 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from dataclasses import FrozenInstanceError
 
 import pytest
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import settings as settings_module
 from settings import (

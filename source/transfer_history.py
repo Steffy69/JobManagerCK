@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
@@ -57,12 +57,27 @@ class TransferHistory:
     # -- public API --------------------------------------------------
 
     def get_record(self, job_name: str) -> JobRecord | None:
-        """Return the record for *job_name*, or None if not tracked."""
+        """Return the record for *job_name*, or None if not tracked.
+
+        The history file is external input (a newer app version's file
+        after a rollback, or a hand edit). Unknown keys are dropped and
+        missing ones defaulted instead of letting ``JobRecord(**entry)``
+        raise TypeError inside a Qt slot — which aborts the process.
+        """
         jobs = self._read_jobs()
         entry = jobs.get(job_name)
-        if entry is None:
+        if not isinstance(entry, dict):
             return None
-        return JobRecord(**entry)
+
+        known = {f.name for f in fields(JobRecord)}
+        filtered = {k: v for k, v in entry.items() if k in known}
+        filtered.setdefault("job_name", job_name)
+        filtered.setdefault("job_type", "UNKNOWN")
+        try:
+            return JobRecord(**filtered)
+        except TypeError:
+            logger.warning("Malformed history entry for %r; ignoring", job_name)
+            return None
 
     def mark_transferred(self, job_name: str, job_type: str) -> JobRecord:
         """Mark a job as transferred and persist the change."""
@@ -107,10 +122,6 @@ class TransferHistory:
         )
         self._save_record(updated)
         return updated
-
-    # deprecated: use mark_moved_to_printed
-    def mark_completed(self, job_name: str, job_type: str = "UNKNOWN") -> JobRecord:
-        return self.mark_moved_to_printed(job_name, job_type)
 
     def clear_moved_to_printed(self, job_name: str) -> JobRecord | None:
         """Reset ``completed_at`` so a job returns from Printed to Active.

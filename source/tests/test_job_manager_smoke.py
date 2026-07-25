@@ -8,18 +8,8 @@ so we don't touch the real S drive.
 
 from __future__ import annotations
 
-# IMPORTANT: this must run before any PyQt/pytest-qt import so pytest-qt
-# binds to PyQt5 rather than the (also-installed) PyQt6.
-import os as _os
-
-_os.environ.setdefault("PYTEST_QT_API", "pyqt5")
-
-import os
-import sys
 
 import pytest
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from job_scanner import Job
 from job_types import JobFiles, JobType
@@ -396,3 +386,104 @@ def test_scan_threads_do_not_accumulate(qtbot, job_manager_window, monkeypatch):
     qtbot.wait(50)
     live = [c for c in window.children() if isinstance(c, JobScanThread)]
     assert len(live) <= 1
+
+
+# -- busy lockout -----------------------------------------------------------
+#
+# While a transfer/print runs, NOTHING may re-enable the action buttons or
+# rebuild the tree: a second operation would rebind _active_thread and
+# destroy the still-running QThread.
+
+
+def test_scan_finishing_while_busy_is_discarded(qtbot, job_manager_window):
+    window = job_manager_window
+    # Select the CO job so buttons would be re-enabled by a rebuild.
+    root = window.jobTreeWidget.topLevelItem(0)
+    window.jobTreeWidget.setCurrentItem(root.child(0))
+    assert window.completeButton.isEnabled() is True
+
+    window._set_ui_busy(True)
+    assert window.transferButton.isEnabled() is False
+
+    # A scan that started before the operation delivers results mid-run.
+    with qtbot.waitSignal(window.jobsRefreshed, timeout=1000):
+        window._on_scan_finished(
+            [_make_job("Job That Appeared Mid Print", has_mdb=True)], []
+        )
+
+    # Neither the tree nor the buttons changed.
+    names = {
+        root.child(i).data(0, Qt.UserRole).name
+        for i in range(root.childCount())
+    }
+    assert "Job That Appeared Mid Print" not in names
+    assert window.transferButton.isEnabled() is False
+    assert window.completeButton.isEnabled() is False
+
+    window._set_ui_busy(False)
+
+
+def test_drop_while_busy_is_rejected(job_manager_window, tmp_path):
+    window = job_manager_window
+    window._set_ui_busy(True)
+
+    window._handle_dropped_folder(str(tmp_path))
+
+    assert "Busy" in window.statusbar.currentMessage()
+    root = window.jobTreeWidget.topLevelItem(0)
+    names = {
+        root.child(i).data(0, Qt.UserRole).name
+        for i in range(root.childCount())
+    }
+    assert tmp_path.name not in names
+    window._set_ui_busy(False)
+
+
+def test_busy_disables_drop_zone_menu_and_shows_cancel(job_manager_window):
+    window = job_manager_window
+
+    window._set_ui_busy(True)
+    assert window._drop_zone.isEnabled() is False
+    assert window.menuBar().isEnabled() is False
+    assert window._cancel_button.isHidden() is False
+
+    window._set_ui_busy(False)
+    assert window._drop_zone.isEnabled() is True
+    assert window.menuBar().isEnabled() is True
+    assert window._cancel_button.isHidden() is True
+
+
+def test_unbusy_revalidates_instead_of_blanket_enable(qtbot, job_manager_window):
+    """After an operation, button state must reflect the selection — the CO
+    job has no .ljd files, so Print must stay disabled."""
+    window = job_manager_window
+    root = window.jobTreeWidget.topLevelItem(0)
+    co_item = None
+    for i in range(root.childCount()):
+        if root.child(i).data(0, Qt.UserRole).name == "Active CO Job":
+            co_item = root.child(i)
+            break
+    window.jobTreeWidget.setCurrentItem(co_item)
+
+    window._set_ui_busy(True)
+    window._set_ui_busy(False)
+
+    assert window.transferButton.isEnabled() is True
+    assert window.printButton.isEnabled() is False  # no labels, no print
+
+
+def test_minimised_restore_does_not_restart_polls_while_busy(
+    job_manager_window,
+):
+    """Busy and minimised previously fought over one switch — restoring the
+    window mid-print restarted the S: scan and spooler polls."""
+    window = job_manager_window
+    window._set_ui_busy(True)
+    assert window._refresh_timer.isActive() is False
+
+    # Simulate the WindowStateChange re-evaluation on restore.
+    window._sync_polling()
+
+    assert window._refresh_timer.isActive() is False  # busy still wins
+    window._set_ui_busy(False)
+    assert window._refresh_timer.isActive() is True

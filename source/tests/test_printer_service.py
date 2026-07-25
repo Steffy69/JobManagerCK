@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import os
-import sys
 from unittest.mock import MagicMock, call
 
 import pytest
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import printer_service
 from printer_service import PrinterServiceUnavailable
@@ -103,33 +100,6 @@ def test_find_zebra_printer_matches_model_only_name(fake_win32print):
     ]
 
     assert printer_service.find_zebra_printer() == "GC420d"
-
-
-# ---------------------------------------------------------------------------
-# is_printer_available
-# ---------------------------------------------------------------------------
-
-
-def test_is_printer_available_true(fake_win32print):
-    fake_win32print.EnumPrinters.return_value = [
-        (0, "", "Zebra GC420D", "port1"),
-    ]
-
-    assert printer_service.is_printer_available("Zebra GC420D") is True
-
-
-def test_is_printer_available_false_on_exception(fake_win32print):
-    fake_win32print.EnumPrinters.side_effect = OSError("boom")
-
-    assert printer_service.is_printer_available("Zebra GC420D") is False
-
-
-def test_is_printer_available_false_when_missing(fake_win32print):
-    fake_win32print.EnumPrinters.return_value = [
-        (0, "", "HP LaserJet", "port1"),
-    ]
-
-    assert printer_service.is_printer_available("Zebra GC420D") is False
 
 
 # ---------------------------------------------------------------------------
@@ -236,65 +206,95 @@ def test_print_via_shellexecute_raises_when_unavailable(no_win32):
 
 
 # ---------------------------------------------------------------------------
-# print_via_default_swap
+# print_via_print_verb / set_default_printer
 # ---------------------------------------------------------------------------
 
 
-def test_print_via_default_swap_restores_previous_default(
-    fake_win32print, fake_win32api, monkeypatch
-):
-    fake_win32print.GetDefaultPrinter.return_value = "HP LaserJet"
-    monkeypatch.setattr(printer_service.time, "sleep", lambda _s: None)
+def test_print_via_print_verb_uses_plain_print_verb(fake_win32api):
+    printer_service.print_via_print_verb("C:/tmp/label.ljd")
 
-    printer_service.print_via_default_swap(
-        "ZDesigner GC420d (EPL)", "C:/tmp/label.ljd", settle_seconds=0
-    )
-
-    assert fake_win32print.SetDefaultPrinter.call_args_list == [
-        call("ZDesigner GC420d (EPL)"),
-        call("HP LaserJet"),
-    ]
     fake_win32api.ShellExecute.assert_called_once_with(
         0, "print", "C:/tmp/label.ljd", None, ".", 0
     )
 
 
-def test_print_via_default_swap_restores_on_shellexecute_error(
-    fake_win32print, fake_win32api, monkeypatch
-):
-    fake_win32print.GetDefaultPrinter.return_value = "HP LaserJet"
-    fake_win32api.ShellExecute.side_effect = OSError("boom")
-    monkeypatch.setattr(printer_service.time, "sleep", lambda _s: None)
-
-    with pytest.raises(OSError, match="boom"):
-        printer_service.print_via_default_swap(
-            "ZDesigner GC420d (EPL)", "C:/tmp/label.ljd"
-        )
-
-    assert fake_win32print.SetDefaultPrinter.call_args_list == [
-        call("ZDesigner GC420d (EPL)"),
-        call("HP LaserJet"),
-    ]
+def test_print_via_print_verb_raises_when_unavailable(no_win32):
+    with pytest.raises(PrinterServiceUnavailable):
+        printer_service.print_via_print_verb("C:/tmp/label.ljd")
 
 
-def test_print_via_default_swap_skips_restore_when_previous_equals_target(
-    fake_win32print, fake_win32api, monkeypatch
-):
-    fake_win32print.GetDefaultPrinter.return_value = "ZDesigner GC420d (EPL)"
-    monkeypatch.setattr(printer_service.time, "sleep", lambda _s: None)
+def test_set_default_printer_delegates(fake_win32print):
+    printer_service.set_default_printer("ZDesigner GC420d (EPL)")
 
-    printer_service.print_via_default_swap(
-        "ZDesigner GC420d (EPL)", "C:/tmp/label.ljd"
+    fake_win32print.SetDefaultPrinter.assert_called_once_with(
+        "ZDesigner GC420d (EPL)"
     )
 
-    assert fake_win32print.SetDefaultPrinter.call_args_list == [
-        call("ZDesigner GC420d (EPL)"),
-    ]
 
-
-def test_print_via_default_swap_raises_when_unavailable(no_win32):
+def test_set_default_printer_raises_when_unavailable(no_win32):
     with pytest.raises(PrinterServiceUnavailable):
-        printer_service.print_via_default_swap("Zebra", "C:/tmp/label.ljd")
+        printer_service.set_default_printer("Zebra")
+
+
+# ---------------------------------------------------------------------------
+# Default-printer crash-recovery marker
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def marker_path(tmp_path, monkeypatch):
+    path = str(tmp_path / "default_printer_backup.txt")
+    monkeypatch.setattr(printer_service, "DEFAULT_PRINTER_MARKER", path)
+    return path
+
+
+def test_marker_round_trip(marker_path):
+    printer_service.save_default_printer_marker("HP LaserJet")
+    with open(marker_path, encoding="utf-8") as fh:
+        assert fh.read() == "HP LaserJet"
+
+    printer_service.clear_default_printer_marker()
+    assert not os.path.exists(marker_path)
+
+
+def test_clear_marker_is_noop_when_absent(marker_path):
+    printer_service.clear_default_printer_marker()  # must not raise
+
+
+def test_restore_if_marked_restores_and_clears(marker_path, fake_win32print):
+    printer_service.save_default_printer_marker("HP LaserJet")
+
+    restored = printer_service.restore_default_printer_if_marked()
+
+    assert restored == "HP LaserJet"
+    fake_win32print.SetDefaultPrinter.assert_called_once_with("HP LaserJet")
+    assert not os.path.exists(marker_path)
+
+
+def test_restore_if_marked_noop_without_marker(marker_path, fake_win32print):
+    assert printer_service.restore_default_printer_if_marked() is None
+    fake_win32print.SetDefaultPrinter.assert_not_called()
+
+
+def test_restore_if_marked_keeps_marker_on_failure(
+    marker_path, fake_win32print
+):
+    printer_service.save_default_printer_marker("HP LaserJet")
+    fake_win32print.SetDefaultPrinter.side_effect = OSError("spooler down")
+
+    assert printer_service.restore_default_printer_if_marked() is None
+    # Marker survives so the next launch can retry.
+    assert os.path.exists(marker_path)
+
+
+def test_restore_if_marked_empty_marker_just_clears(
+    marker_path, fake_win32print
+):
+    printer_service.save_default_printer_marker("")
+
+    assert printer_service.restore_default_printer_if_marked() is None
+    fake_win32print.SetDefaultPrinter.assert_not_called()
+    assert not os.path.exists(marker_path)
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +335,43 @@ def test_clear_print_queue_permission_error_reraised(fake_win32print):
         printer_service.clear_print_queue("Zebra GC420D")
 
     fake_win32print.ClosePrinter.assert_called_once_with("HPRINTER")
+
+
+def test_clear_print_queue_translates_pywintypes_access_denied(
+    fake_win32print,
+):
+    """The REAL exception pywin32 raises for access-denied is
+    ``pywintypes.error`` with winerror 5 — not Python's PermissionError.
+    This is what an unelevated SetJob actually produces, and it must reach
+    the settings dialog as PermissionError so the "run as administrator"
+    guidance fires."""
+    pywintypes = pytest.importorskip("pywintypes")
+
+    fake_win32print.OpenPrinter.return_value = "HPRINTER"
+    fake_win32print.EnumJobs.return_value = [{"JobId": 1}]
+    fake_win32print.SetJob.side_effect = pywintypes.error(
+        5, "SetJob", "Access is denied."
+    )
+
+    with pytest.raises(PermissionError, match="administrator"):
+        printer_service.clear_print_queue("Zebra GC420D")
+
+    fake_win32print.ClosePrinter.assert_called_once_with("HPRINTER")
+
+
+def test_clear_print_queue_other_pywintypes_errors_pass_through(
+    fake_win32print,
+):
+    pywintypes = pytest.importorskip("pywintypes")
+
+    fake_win32print.OpenPrinter.return_value = "HPRINTER"
+    fake_win32print.EnumJobs.return_value = [{"JobId": 1}]
+    fake_win32print.SetJob.side_effect = pywintypes.error(
+        1722, "SetJob", "The RPC server is unavailable."
+    )
+
+    with pytest.raises(pywintypes.error):
+        printer_service.clear_print_queue("Zebra GC420D")
 
 
 # ---------------------------------------------------------------------------

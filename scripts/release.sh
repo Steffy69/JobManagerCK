@@ -8,11 +8,13 @@
 #   scripts/release.sh 2.2.0 "Title" notes.md  # + notes from file
 #
 # Does:
-#   1. Bumps CURRENT_VERSION in source/updater.py
-#   2. Runs pytest (aborts on failure)
-#   3. Rebuilds dist/JobManager.exe via PyInstaller
-#   4. Commits the version bump and pushes to origin/main
-#   5. Creates a GitHub release with the exe as the asset
+#   1. Refuses to run from a dirty working tree (the exe is built from the
+#      tree, and a release must ship exactly what the repo records)
+#   2. Bumps CURRENT_VERSION in source/updater.py (verified, not hoped)
+#   3. Runs pytest (aborts on failure)
+#   4. Rebuilds dist/JobManager.exe via PyInstaller
+#   5. Commits the version bump and pushes to origin/main
+#   6. Creates a GitHub release with the exe as the asset
 
 set -euo pipefail
 
@@ -21,6 +23,20 @@ SOURCE_DIR="$REPO_ROOT/source"
 UPDATER="$SOURCE_DIR/updater.py"
 DIST_EXE="$SOURCE_DIR/dist/JobManager.exe"
 PYTHON="${PYTHON:-C:/Users/stefa/AppData/Local/Python/bin/python.exe}"
+# Own basetemp: the default %TEMP%\pytest-of-<user> dir has been seen with
+# broken ACLs, which fails every tmp_path test and blocks releases.
+PYTEST_TMP="${LOCALAPPDATA:-$HOME}/Temp/jmck-release-pytest"
+
+if ! command -v "$PYTHON" >/dev/null 2>&1; then
+  PYTHON="python"
+fi
+
+# -- 1. clean tree ----------------------------------------------------------
+if [ -n "$(cd "$REPO_ROOT" && git status --porcelain -- source/ scripts/ releases/)" ]; then
+  echo "ERROR: uncommitted changes in the working tree." >&2
+  echo "Commit (or stash) them first — the release must match the repo." >&2
+  exit 1
+fi
 
 CURRENT=$(grep -oP 'CURRENT_VERSION = "\K[^"]+' "$UPDATER")
 if [ -z "${CURRENT:-}" ]; then
@@ -42,13 +58,20 @@ echo "=========================================="
 echo "  JobManagerCK release: v$CURRENT -> v$NEW"
 echo "=========================================="
 
+# -- 2. version bump (verified) --------------------------------------------
 echo ">> Bumping CURRENT_VERSION in updater.py"
 sed -i "s/CURRENT_VERSION = \"$CURRENT\"/CURRENT_VERSION = \"$NEW\"/" "$UPDATER"
+if ! grep -q "CURRENT_VERSION = \"$NEW\"" "$UPDATER"; then
+  echo "ERROR: version bump did not take (still $CURRENT?)" >&2
+  exit 1
+fi
 grep 'CURRENT_VERSION' "$UPDATER"
 
+# -- 3. tests ---------------------------------------------------------------
 echo ">> Running tests"
-(cd "$SOURCE_DIR" && "$PYTHON" -m pytest tests/ -q)
+(cd "$REPO_ROOT" && "$PYTHON" -m pytest -q --basetemp="$PYTEST_TMP")
 
+# -- 4. build ---------------------------------------------------------------
 echo ">> Cleaning build artifacts"
 rm -rf "$SOURCE_DIR/build" "$SOURCE_DIR/dist"
 
@@ -61,17 +84,22 @@ fi
 EXE_SIZE=$(du -h "$DIST_EXE" | cut -f1)
 echo "   built: $DIST_EXE ($EXE_SIZE)"
 
+# -- 5. commit + push -------------------------------------------------------
 echo ">> Committing version bump"
 (cd "$REPO_ROOT" && git add source/updater.py && git commit -m "chore: bump version to $NEW")
 
 echo ">> Pushing to origin/main"
 (cd "$REPO_ROOT" && git push origin main)
 
+# -- 6. release -------------------------------------------------------------
 echo ">> Creating GitHub release v$NEW"
 if [ -n "$NOTES_FILE" ] && [ -f "$NOTES_FILE" ]; then
   (cd "$REPO_ROOT" && gh release create "v$NEW" "$DIST_EXE" --title "$TITLE" --notes-file "$NOTES_FILE")
 else
-  (cd "$REPO_ROOT" && gh release create "v$NEW" "$DIST_EXE" --title "$TITLE" --notes "Release v$NEW")
+  # Default notes: the commits since the last release. These are shown to
+  # the operator in the update dialog, so a bare "Release vX" is noise.
+  NOTES=$(cd "$REPO_ROOT" && git log --oneline "v$CURRENT"..HEAD 2>/dev/null || echo "Release v$NEW")
+  (cd "$REPO_ROOT" && gh release create "v$NEW" "$DIST_EXE" --title "$TITLE" --notes "$NOTES")
 fi
 
 echo ""

@@ -4,11 +4,8 @@ from __future__ import annotations
 
 import glob
 import os
-import sys
 
 import pytest
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from transfer_history import JobRecord, TransferHistory
 
@@ -75,14 +72,6 @@ def test_mark_moved_to_printed_creates_record_if_absent(
 
 
 # -- backwards compatibility ------------------------------------------------
-
-
-def test_deprecated_mark_completed_still_works(history: TransferHistory) -> None:
-    history.mark_completed("LEGACY", "CABINETRY_ONLINE")
-    assert history.get_status("LEGACY") == "Printed"
-    record = history.get_record("LEGACY")
-    assert record is not None
-    assert record.completed_at is not None
 
 
 def test_completed_at_field_preserved_in_record(history: TransferHistory) -> None:

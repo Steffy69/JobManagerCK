@@ -1,5 +1,5 @@
-PyQt5>=5.15
-pywin32>=306
-requests>=2.31
-pytest>=8.0
-pytest-qt>=4.4
+# Runtime dependencies — what the frozen exe needs.
+# Dev/test/build tools live in requirements-dev.txt.
+PyQt5>=5.15,<6
+pywin32>=306,<400
+requests>=2.31,<3

@@ -19,13 +19,17 @@ UNKNOWN_MATERIAL = "UNKNOWN"
 
 @dataclass(frozen=True)
 class PrintItem:
-    """A single item in a print sequence."""
+    """A single item in a print sequence.
+
+    Separators carry ``job_name`` so every printed separator reads
+    ``JOB NAME / MATERIAL`` — the operator can always see which job a stack
+    belongs to while peeling.
+    """
 
     kind: str
     file_path: str
     material: str
     board_number: int | None
-    is_job_separator: bool = False
     job_name: str = ""
 
 
@@ -198,14 +202,12 @@ def build_print_sequence(
     for material in peel_materials:
         entries = _within_material_peel_order(grouped[material], reverse_within)
         if include_separators:
-            is_topmost = material == peel_materials[0]
             peel_items.append(
                 PrintItem(
                     kind=SEPARATOR_LABEL_KIND,
                     file_path="",
                     material=material,
                     board_number=None,
-                    is_job_separator=is_topmost,
                     job_name=job_name,
                 )
             )

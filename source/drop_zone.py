@@ -31,10 +31,33 @@ STYLE_DRAG_OVER = """
 """
 
 
+def _local_directories(mime_data) -> list[str]:
+    """Extract the local DIRECTORY paths from a drag's mime data.
+
+    Files, Outlook virtual items and other non-filesystem drops resolve to
+    an empty ``toLocalFile()`` or a non-directory and are excluded.
+    """
+    dirs: list[str] = []
+    for url in mime_data.urls():
+        path = url.toLocalFile()
+        if path and os.path.isdir(path):
+            dirs.append(path)
+    return dirs
+
+
 class DropZone(QFrame):
-    """A drop target that accepts any directory and emits its path."""
+    """A drop target that accepts job FOLDER drops and emits their paths.
+
+    The old behaviour lit up green for any URL drag and then silently
+    ignored files and second-and-later folders — the operator saw the app
+    "accept" a drop and do nothing. Now the drag is only accepted when it
+    contains at least one folder (the OS shows the no-drop cursor
+    otherwise), every dropped folder is emitted, and a rejected drop says
+    why via ``dropRejected``.
+    """
 
     fileDropped = pyqtSignal(str)
+    dropRejected = pyqtSignal(str)  # human-readable reason
 
     def __init__(self) -> None:
         super().__init__()
@@ -50,7 +73,7 @@ class DropZone(QFrame):
         self.setLayout(layout)
 
     def dragEnterEvent(self, event) -> None:
-        if event.mimeData().hasUrls():
+        if _local_directories(event.mimeData()):
             event.acceptProposedAction()
             self.setStyleSheet(STYLE_DRAG_OVER)
 
@@ -58,8 +81,13 @@ class DropZone(QFrame):
         self.setStyleSheet(STYLE_NORMAL)
 
     def dropEvent(self, event) -> None:
-        files: list[str] = [u.toLocalFile() for u in event.mimeData().urls()]
-        if files and os.path.isdir(files[0]):
-            logger.info("Folder dropped: %s", files[0])
-            self.fileDropped.emit(files[0])
+        dirs = _local_directories(event.mimeData())
+        if dirs:
+            for path in dirs:
+                logger.info("Folder dropped: %s", path)
+                self.fileDropped.emit(path)
+        else:
+            self.dropRejected.emit(
+                "That was a file — drop the job's folder instead"
+            )
         self.dragLeaveEvent(event)

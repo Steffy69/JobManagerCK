@@ -11,8 +11,8 @@ The dialog intentionally replaces the old ``QMessageBox`` confirmation: it is
 both the "preview" and the "are you sure?" step in a single screen. Rows are
 painted with a fixed pastel palette cycled by index so the stack reads as an
 intuitive graphic rather than a wall of text. A monospace preview label below
-the list echoes the current order (matching the semantic of
-``build_sequence_peel_preview``) and updates live as the user drags rows.
+the list echoes the peel order the printer will produce and updates live as
+the user drags rows.
 
 The dialog does not touch :mod:`settings` — callers are responsible for
 persisting the user's chosen order back to ``AppSettings.material_priority``.
@@ -242,13 +242,12 @@ class PrintOrderDialog(QDialog):
         for material, count in ordered:
             if self._include_separators:
                 line_index += 1
-                if line_index == 1:
-                    # Topmost separator carries the job name — matches the
-                    # is_job_separator=True branch in build_print_sequence.
-                    sep_text = f"{self._job_name} / {material}"
-                else:
-                    sep_text = material
-                lines.append(f"  {line_index}. [SEP] {sep_text}")
+                # EVERY separator prints "JOB / MATERIAL" so the operator can
+                # see whose stack they're peeling — the preview must show
+                # exactly what will come off the roll.
+                lines.append(
+                    f"  {line_index}. [SEP] {self._job_name} / {material}"
+                )
             line_index += 1
             label_word = "label" if count == 1 else "labels"
             lines.append(f"  {line_index}. {material} - {count} {label_word}")

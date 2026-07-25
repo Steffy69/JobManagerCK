@@ -8,12 +8,6 @@ system or a real Zebra printer.
 
 from __future__ import annotations
 
-# IMPORTANT: this must run before any PyQt/pytest-qt import so pytest-qt
-# binds to PyQt5 rather than the (also-installed) PyQt6.
-import os as _os
-
-_os.environ.setdefault("PYTEST_QT_API", "pyqt5")
-
 import os
 import sys
 

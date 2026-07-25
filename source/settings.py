@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -25,7 +25,14 @@ _MIN_POLL_INTERVAL_MS = 1000
 @dataclass(frozen=True)
 class AppSettings:
     reverse_order: bool = True
+    # Pause after each LABEL is sent. Paces submissions into the third-party
+    # .ljd handler so spool order stays intact. 2.0 is the historically safe
+    # value; lower it only after a supervised run on the physical GC420D.
     print_delay_seconds: float = 2.0
+    # Pause after each SEPARATOR is sent. Separators are raw ZPL written
+    # straight into the printer's small internal buffer, and a misplaced
+    # separator silently mis-batches boards — keep this conservative.
+    separator_delay_seconds: float = 2.0
     # Sticky per-job material order. Starts with WHMR as the built-in
     # fallback — the PrintOrderDialog grows this tuple over time as the
     # user confirms per-job orders, reflecting their last-used preference.
@@ -70,6 +77,11 @@ def _from_dict(data: dict[str, Any]) -> AppSettings:
         reverse_order=bool(data.get("reverse_order", defaults.reverse_order)),
         print_delay_seconds=_clamp_delay(
             data.get("print_delay_seconds", defaults.print_delay_seconds)
+        ),
+        separator_delay_seconds=_clamp_delay(
+            data.get(
+                "separator_delay_seconds", defaults.separator_delay_seconds
+            )
         ),
         material_priority=_coerce_material_priority(
             data.get("material_priority", defaults.material_priority)

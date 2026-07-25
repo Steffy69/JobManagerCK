@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
-import os
-import sys
 from dataclasses import FrozenInstanceError
 
 import pytest
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from print_sequencer import (  # noqa: E402
     LABEL_KIND,
@@ -242,7 +238,6 @@ def test_build_sequence_single_material_with_separators():
     assert seq[2].kind == LABEL_KIND and seq[2].board_number == 1
     topmost = seq[3]
     assert topmost.kind == SEPARATOR_LABEL_KIND
-    assert topmost.is_job_separator is True
     assert topmost.material == "WHMR"
     assert topmost.job_name == "JOB"
     assert topmost.file_path == ""
@@ -277,7 +272,6 @@ def test_build_sequence_jelprewir_full_example():
     sep_black = seq[3]
     assert sep_black.kind == SEPARATOR_LABEL_KIND
     assert sep_black.material == "BlackHMR"
-    assert sep_black.is_job_separator is False
     assert sep_black.job_name == "JELPREWIR CL"
 
     # Items 4..19 — WALNUT 16, 15, ..., 1
@@ -291,7 +285,6 @@ def test_build_sequence_jelprewir_full_example():
     sep_walnut = seq[20]
     assert sep_walnut.kind == SEPARATOR_LABEL_KIND
     assert sep_walnut.material == "WALNUT"
-    assert sep_walnut.is_job_separator is False
     assert sep_walnut.job_name == "JELPREWIR CL"
 
     # Items 21..54 — WHMR 34, 33, ..., 1
@@ -304,7 +297,6 @@ def test_build_sequence_jelprewir_full_example():
     # Item 55 — JOB separator, topmost in stack
     job_sep = seq[55]
     assert job_sep.kind == SEPARATOR_LABEL_KIND
-    assert job_sep.is_job_separator is True
     assert job_sep.job_name == "JELPREWIR CL"
     assert job_sep.material == "WHMR"
     assert job_sep.file_path == ""
@@ -384,7 +376,6 @@ def test_build_sequence_only_unknown_files():
     assert len(labels) == 2
     assert all(it.material == UNKNOWN_MATERIAL for it in labels)
     assert len(separators) == 1
-    assert separators[0].is_job_separator is True
     assert separators[0].material == UNKNOWN_MATERIAL
 
 
@@ -407,13 +398,11 @@ def test_build_sequence_two_materials_both_have_material_separators_except_top()
     assert seq[0].material == "WALNUT" and seq[0].board_number == 1
     assert seq[1].kind == SEPARATOR_LABEL_KIND
     assert seq[1].material == "WALNUT"
-    assert seq[1].is_job_separator is False
     assert seq[1].job_name == "JOB"
     assert seq[2].material == "WHMR" and seq[2].board_number == 2
     assert seq[3].material == "WHMR" and seq[3].board_number == 1
     assert seq[4].kind == SEPARATOR_LABEL_KIND
     assert seq[4].material == "WHMR"
-    assert seq[4].is_job_separator is True
     assert seq[4].job_name == "JOB"
 
 
@@ -513,5 +502,4 @@ def test_print_item_defaults():
         material="WHMR",
         board_number=1,
     )
-    assert item.is_job_separator is False
     assert item.job_name == ""

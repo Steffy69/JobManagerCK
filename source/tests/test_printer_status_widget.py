@@ -1,22 +1,14 @@
 """Tests for ``source/printer_status_widget.PrinterStatusWidget``.
 
 Uses pytest-qt's ``qtbot`` fixture and monkeypatches
-``printer_service.is_printer_available`` / ``find_zebra_printer`` so polls
+``printer_service.list_printers`` so polls
 are deterministic and do not touch the real Windows print spooler.
 """
 
 from __future__ import annotations
 
-import os
-import sys
 
 import pytest
-
-# Ensure pytest-qt binds to PyQt5 — the test suite also has PyQt6 in the env
-# on some dev machines, and the root conftest does the same dance.
-os.environ.setdefault("PYTEST_QT_API", "pyqt5")
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 pytest.importorskip("PyQt5.QtWidgets")
 pytest.importorskip("pytestqt")
@@ -243,11 +235,19 @@ def test_set_printer_name_triggers_recheck(qtbot, stub_printer_service):
     assert widget.resolved_printer_name() == "Old Printer"
     calls_after_first = stub_printer_service["list_calls"]
 
-    # Re-point at a new printer. set_printer_name should issue another poll.
+    # Re-point at a new printer. set_printer_name polls again — on a worker
+    # thread now, so wait for the result to land.
     widget.set_printer_name("New Printer")
 
-    assert stub_printer_service["list_calls"] == calls_after_first + 1
-    assert widget.resolved_printer_name() == "New Printer"
+    qtbot.waitUntil(
+        lambda: stub_printer_service["list_calls"] == calls_after_first + 1,
+        timeout=1000,
+    )
+    qtbot.waitUntil(
+        lambda: widget.resolved_printer_name() == "New Printer",
+        timeout=1000,
+    )
+    widget.stop()  # join the poll thread before teardown
 
 
 # ---------------------------------------------------------------------------

@@ -19,16 +19,23 @@ Two item kinds live in the sequence:
     A raw ZPL label rendered by :mod:`zpl_templates`. Sent as bytes to the
     Zebra via :func:`printer_service.send_raw_zpl`.
 
-Between every print we sleep ``settings.print_delay_seconds`` to give the
-Zebra's little internal buffer a chance to drain. The sleep runs on the
-worker thread (a real :class:`QThread`) so the GUI never blocks.
+After each LABEL we sleep ``settings.print_delay_seconds`` to pace
+submissions into the handler; after each SEPARATOR we sleep
+``settings.separator_delay_seconds`` to let the Zebra's small internal
+buffer drain. Both sleeps run on the worker thread in interruptible slices,
+so the GUI never blocks and Cancel takes effect within ~100 ms.
+
+If ``printto`` fails (some handlers reject the verb, or mis-parse printer
+names containing parentheses), the run falls back ONCE: it saves the user's
+default printer, makes the Zebra the system default for the REST of the run,
+prints via the plain ``print`` verb, and restores the saved default when the
+run ends — success, failure, or cancel. A marker file lets the next launch
+restore the default even if the process dies mid-run.
 """
 
 from __future__ import annotations
 
 import logging
-import time
-from collections import Counter
 from pathlib import Path
 
 from PyQt5.QtCore import QThread, pyqtSignal
@@ -39,172 +46,6 @@ from print_sequencer import LABEL_KIND, SEPARATOR_LABEL_KIND, PrintItem
 from settings import AppSettings
 
 logger = logging.getLogger(__name__)
-
-
-def build_sequence_preview(sequence: list[PrintItem]) -> str:
-    """Return a human-readable summary of a print sequence.
-
-    Groups labels by material in **peel order** (top of list = peeled first)
-    and summarises separators as a total count. Used by the confirmation
-    dialog before printing starts so Marinko can eyeball the job.
-
-    Example output::
-
-        BlackHMR: 3 labels
-        WALNUT: 16 labels
-        WHMR: 34 labels
-        3 separators
-
-    An empty sequence returns the string ``"(empty sequence)"``.
-    """
-    if not sequence:
-        return "(empty sequence)"
-
-    label_counts: Counter[str] = Counter()
-    separator_count = 0
-    # Track first-seen order of materials in peel order. The sequence arrives
-    # in *print* order (reverse peel), so we reverse-walk and record first
-    # encounters — the first label of a material in peel order is the last
-    # instance we see when walking print order.
-    peel_order_materials: list[str] = []
-    seen: set[str] = set()
-    for item in reversed(sequence):
-        if item.kind == LABEL_KIND:
-            label_counts[item.material] += 1
-            if item.material not in seen:
-                seen.add(item.material)
-                peel_order_materials.append(item.material)
-        elif item.kind == SEPARATOR_LABEL_KIND:
-            separator_count += 1
-
-    lines: list[str] = []
-    for material in peel_order_materials:
-        count = label_counts[material]
-        label_word = "label" if count == 1 else "labels"
-        lines.append(f"{material}: {count} {label_word}")
-
-    if separator_count:
-        sep_word = "separator" if separator_count == 1 else "separators"
-        lines.append(f"{separator_count} {sep_word}")
-
-    return "\n".join(lines)
-
-
-def build_sequence_peel_preview(
-    sequence: list[PrintItem], job_name: str
-) -> str:
-    """Return a rich, numbered peel-order preview of a print sequence.
-
-    Unlike :func:`build_sequence_preview` — which gives a flat per-material
-    count — this function walks the sequence in **peel order** (the reverse
-    of the print order in which ``sequence`` arrives) and renders a numbered,
-    multi-line summary showing what Marinko will physically see coming off the
-    roll, top-down.
-
-    Separators are shown as their own ``[SEP] ...`` lines. Consecutive labels
-    of the same material are collapsed into a single ``MATERIAL labels (N)``
-    line so long jobs stay readable. The final line is a total:
-
-    * with separators::
-
-        Total: 56 items (53 labels + 3 separators)
-
-    * without::
-
-        Total: 53 items (53 labels)
-
-    Parameters
-    ----------
-    sequence:
-        Print-order list of :class:`PrintItem` as produced by
-        :func:`print_sequencer.build_print_sequence`. May be empty.
-    job_name:
-        Display name of the job. Currently only used for the caller's context
-        — the ``job_name`` that appears in ``[SEP]`` lines comes from the
-        separator ``PrintItem`` itself, so heterogeneous job names inside one
-        sequence still render correctly. Kept in the signature because the
-        caller (:meth:`JobManager._print_labels`) already has it handy and it
-        future-proofs the API.
-
-    Returns
-    -------
-    str
-        A multi-line string suitable for display in a ``QMessageBox``. An
-        empty sequence returns ``"(empty sequence)"``.
-    """
-    # job_name is intentionally unused directly — separator items carry the
-    # job name they were built with. We keep the parameter so callers don't
-    # have to re-derive it later and so the signature matches the brief.
-    del job_name
-
-    if not sequence:
-        return "(empty sequence)"
-
-    lines: list[str] = ["Peel order (top of roll -> bottom):"]
-
-    # Walk in peel order = reverse of the print order we were given.
-    peel_items = list(reversed(sequence))
-
-    label_total = 0
-    separator_total = 0
-    line_index = 0
-
-    # Grouping state: accumulate consecutive labels of the same material.
-    group_material: str | None = None
-    group_count = 0
-
-    def flush_group() -> None:
-        nonlocal group_material, group_count, line_index
-        if group_material is None or group_count == 0:
-            group_material = None
-            group_count = 0
-            return
-        line_index += 1
-        label_word = "label" if group_count == 1 else "labels"
-        lines.append(
-            f"  {line_index}. {group_material} {label_word} ({group_count})"
-        )
-        group_material = None
-        group_count = 0
-
-    for item in peel_items:
-        if item.kind == SEPARATOR_LABEL_KIND:
-            flush_group()
-            separator_total += 1
-            line_index += 1
-            if item.job_name:
-                sep_text = f"{item.job_name} / {item.material}"
-            else:
-                sep_text = item.material
-            lines.append(f"  {line_index}. [SEP] {sep_text}")
-        elif item.kind == LABEL_KIND:
-            label_total += 1
-            if group_material == item.material:
-                group_count += 1
-            else:
-                flush_group()
-                group_material = item.material
-                group_count = 1
-        else:
-            # Unknown kind — flush and render a placeholder so nothing is
-            # silently dropped from the preview.
-            flush_group()
-            line_index += 1
-            lines.append(f"  {line_index}. <unknown: {item.kind}>")
-
-    flush_group()
-
-    total_items = label_total + separator_total
-    label_word = "label" if label_total == 1 else "labels"
-    if separator_total:
-        sep_word = "separator" if separator_total == 1 else "separators"
-        totals_suffix = f"({label_total} {label_word} + {separator_total} {sep_word})"
-    else:
-        totals_suffix = f"({label_total} {label_word})"
-
-    lines.append("")
-    lines.append(f"Total: {total_items} items {totals_suffix}")
-    return "\n".join(lines)
 
 
 class LabelPrinterThread(QThread):
@@ -234,6 +75,9 @@ class LabelPrinterThread(QThread):
         self._sequence = list(sequence)
         self._settings = settings
         self._zebra_printer = zebra_printer
+        # Run-level default-printer swap state (see module docstring).
+        self._swapped = False
+        self._original_default: str | None = None
 
     # ------------------------------------------------------------------
     # Description helper (kept separate so it's easy to test / tweak)
@@ -254,6 +98,102 @@ class LabelPrinterThread(QThread):
         return f"<unknown item kind: {item.kind}>"
 
     # ------------------------------------------------------------------
+    # Cancellation / pacing helpers
+    # ------------------------------------------------------------------
+
+    def _interruptible_sleep(self, seconds: float) -> bool:
+        """Sleep in ~100 ms slices, returning False if cancel was requested.
+
+        ``time.sleep`` is uninterruptible — a full-length sleep between every
+        item is what previously made a 2-minute print run impossible to
+        cancel. Slicing bounds cancel latency at ~100 ms.
+        """
+        remaining_ms = int(max(0.0, seconds) * 1000)
+        while remaining_ms > 0:
+            if self.isInterruptionRequested():
+                return False
+            slice_ms = min(100, remaining_ms)
+            self.msleep(slice_ms)
+            remaining_ms -= slice_ms
+        return not self.isInterruptionRequested()
+
+    def _print_label(self, item: PrintItem) -> None:
+        """Print one label, falling back to the default-printer swap ONCE.
+
+        The first ``printto`` failure flips the whole run into swap mode:
+        the user's default printer is saved (plus a crash-recovery marker on
+        disk), the Zebra becomes the system default, and this and every
+        remaining label goes out via the plain ``print`` verb. One swap per
+        run instead of one per label means a single restore point and no
+        settle-time race with the handler.
+        """
+        if self._swapped:
+            printer_service.print_via_print_verb(item.file_path)
+            return
+
+        try:
+            printer_service.print_via_shellexecute(
+                self._zebra_printer, item.file_path
+            )
+        except Exception as exc:  # noqa: BLE001 - any printto failure
+            logger.warning(
+                "printto failed for %s (%s); swapping default printer to %r "
+                "for the rest of the run",
+                Path(item.file_path).name,
+                exc,
+                self._zebra_printer,
+            )
+            self._original_default = printer_service.get_default_printer()
+            printer_service.save_default_printer_marker(
+                self._original_default or ""
+            )
+            printer_service.set_default_printer(self._zebra_printer)
+            self._swapped = True
+            printer_service.print_via_print_verb(item.file_path)
+
+    def _restore_default_printer(self) -> str | None:
+        """Undo the run-level swap. Returns a warning string on failure.
+
+        Idempotent — safe to call from both the normal exit paths and the
+        ``finally`` backstop.
+        """
+        if not self._swapped:
+            return None
+        self._swapped = False
+
+        if not self._original_default:
+            # There was no default to restore. Leave the Zebra in place but
+            # tell the user rather than staying silent.
+            printer_service.clear_default_printer_marker()
+            return (
+                "The Windows default printer was changed to the Zebra during "
+                "this run and there was no previous default to restore."
+            )
+
+        try:
+            printer_service.set_default_printer(self._original_default)
+            printer_service.clear_default_printer_marker()
+            logger.info(
+                "Restored default printer to %r", self._original_default
+            )
+            return None
+        except Exception:  # noqa: BLE001 - must not mask the run result
+            logger.exception(
+                "Failed to restore default printer to %r",
+                self._original_default,
+            )
+            # Keep the marker: the next launch will retry the restore.
+            return (
+                f"Could not restore the Windows default printer to "
+                f"'{self._original_default}'. It will be restored "
+                "automatically the next time Job Manager starts."
+            )
+
+    @staticmethod
+    def _with_warning(message: str, warning: str | None) -> str:
+        return f"{message}\n\nWARNING: {warning}" if warning else message
+
+    # ------------------------------------------------------------------
     # Thread entry point
     # ------------------------------------------------------------------
 
@@ -269,39 +209,48 @@ class LabelPrinterThread(QThread):
         total = len(self._sequence)
         label_count = 0
         separator_count = 0
-        delay = max(0.0, float(self._settings.print_delay_seconds))
+        label_delay = max(0.0, float(self._settings.print_delay_seconds))
+        separator_delay = max(
+            0.0, float(self._settings.separator_delay_seconds)
+        )
 
         logger.info(
-            "Printing sequence of %d items to %r (delay=%.2fs)",
+            "Printing sequence of %d items to %r "
+            "(label delay=%.2fs, separator delay=%.2fs)",
             total,
             self._zebra_printer,
-            delay,
+            label_delay,
+            separator_delay,
         )
+
+        def cancel_message(sent: int) -> str:
+            return (
+                f"Cancelled — sent {sent} of {total} items "
+                f"({label_count} labels + {separator_count} separators). "
+                "Remove any unwanted labels from the printer."
+            )
 
         try:
             for index, item in enumerate(self._sequence, start=1):
+                if self.isInterruptionRequested():
+                    self.finished.emit(
+                        False,
+                        self._with_warning(
+                            cancel_message(index - 1),
+                            self._restore_default_printer(),
+                        ),
+                    )
+                    return
+
                 description = self._describe_item(item)
                 self.progress.emit(index, total, description)
 
                 if item.kind == LABEL_KIND:
-                    try:
-                        printer_service.print_via_shellexecute(
-                            self._zebra_printer, item.file_path
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "printto failed for %s (%s); falling back to "
-                            "default-printer swap",
-                            Path(item.file_path).name,
-                            exc,
-                        )
-                        printer_service.print_via_default_swap(
-                            self._zebra_printer,
-                            item.file_path,
-                            settle_seconds=max(delay, 1.5),
-                        )
+                    self._print_label(item)
                     label_count += 1
-                    logger.debug("Sent label %d/%d: %s", index, total, description)
+                    logger.debug(
+                        "Sent label %d/%d: %s", index, total, description
+                    )
                 elif item.kind == SEPARATOR_LABEL_KIND:
                     zpl = zpl_templates.build_job_separator(
                         item.job_name, item.material
@@ -324,15 +273,42 @@ class LabelPrinterThread(QThread):
                         item.kind,
                     )
 
-                if index < total and delay > 0:
-                    time.sleep(delay)
+                if index < total:
+                    # Separators guard batch boundaries and the printer's
+                    # small buffer — they keep their own (conservative)
+                    # delay independent of the label pacing.
+                    delay = (
+                        separator_delay
+                        if item.kind == SEPARATOR_LABEL_KIND
+                        else label_delay
+                    )
+                    if not self._interruptible_sleep(delay):
+                        self.finished.emit(
+                            False,
+                            self._with_warning(
+                                cancel_message(index),
+                                self._restore_default_printer(),
+                            ),
+                        )
+                        return
 
+            restore_warning = self._restore_default_printer()
             summary = (
                 f"Printed {total} items "
                 f"({label_count} labels + {separator_count} separators)"
             )
-            self.finished.emit(True, summary)
+            self.finished.emit(
+                True, self._with_warning(summary, restore_warning)
+            )
 
         except Exception as exc:  # noqa: BLE001 - surface any failure to UI
             logger.exception("Label printing failed")
-            self.finished.emit(False, f"Printing failed: {exc}")
+            restore_warning = self._restore_default_printer()
+            self.finished.emit(
+                False,
+                self._with_warning(f"Printing failed: {exc}", restore_warning),
+            )
+        finally:
+            # Backstop for any path that slipped past the explicit restores
+            # (idempotent — a no-op when already restored).
+            self._restore_default_printer()

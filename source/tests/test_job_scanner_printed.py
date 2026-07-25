@@ -6,12 +6,7 @@ scanner walks it the same way ``scan_jobs`` walks the active sources.
 
 from __future__ import annotations
 
-import os
-import sys
 
-import pytest
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from job_scanner import PRINTED_DIR, Job, scan_printed_jobs
 from job_types import JobType

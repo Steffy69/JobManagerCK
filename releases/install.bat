@@ -1,7 +1,7 @@
 @echo off
 setlocal
 echo ============================================
-echo  Installing Job Manager CK v2.1
+echo  Installing Job Manager CK
 echo ============================================
 echo.
 
@@ -26,8 +26,11 @@ if exist "%LOCAL_SOURCE%" (
 
 echo Source: downloading from GitHub...
 echo   %GITHUB_URL%
+rem Remove any stale/partial download from a previous failed run — the
+rem success test below must reflect THIS download, not leftovers.
+if exist "%TEMP_DOWNLOAD%" del /f /q "%TEMP_DOWNLOAD%" >nul 2>&1
 powershell -NoProfile -Command "try { $ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '%GITHUB_URL%' -OutFile '%TEMP_DOWNLOAD%' -UseBasicParsing; exit 0 } catch { Write-Host $_.Exception.Message; exit 1 }"
-if exist "%TEMP_DOWNLOAD%" (
+if not errorlevel 1 if exist "%TEMP_DOWNLOAD%" (
     set "SOURCE=%TEMP_DOWNLOAD%"
     echo Download complete.
     goto :have_source
