@@ -34,36 +34,28 @@ from printer_status_widget import PrinterStatusWidget  # noqa: E402
 def stub_printer_service(monkeypatch):
     """Mutable container tests mutate to control poll results.
 
-    Each test can write to ``state["available"]`` to simulate the printer
-    coming online/offline, ``state["find_result"]`` to change what
-    ``find_zebra_printer`` returns, and ``state["raise"]`` to force either
-    backend call to raise.
+    The widget resolves both "which printer" and "is it there" from a single
+    ``list_printers`` enumeration, so that is the one call to stub. Tests
+    write ``state["available"]`` to simulate the printer coming online or
+    offline, ``state["find_result"]`` to change which Zebra auto-detect
+    should discover, and ``state["raise"]`` to force the backend to raise.
     """
     state = {
-        "available": False,
-        "find_result": "Zebra GC420D",
-        "is_available_calls": [],
-        "find_calls": 0,
+        # Printers the spooler reports as installed. A widget is "online"
+        # when its target printer appears in here.
+        "names": [],
+        "list_calls": 0,
         "raise": False,
     }
 
-    def fake_is_available(name: str) -> bool:
-        state["is_available_calls"].append(name)
+    def fake_list_printers() -> list[str]:
+        state["list_calls"] += 1
         if state["raise"]:
             raise RuntimeError("simulated printer service failure")
-        return bool(state["available"])
-
-    def fake_find_zebra():
-        state["find_calls"] += 1
-        if state["raise"]:
-            raise RuntimeError("simulated find failure")
-        return state["find_result"]
+        return list(state["names"])
 
     monkeypatch.setattr(
-        printer_status_widget, "is_printer_available", fake_is_available
-    )
-    monkeypatch.setattr(
-        printer_status_widget, "find_zebra_printer", fake_find_zebra
+        printer_status_widget, "list_printers", fake_list_printers
     )
     return state
 
@@ -81,15 +73,14 @@ def test_initial_state_disconnected(qtbot, stub_printer_service):
     assert widget.is_online() is False
     assert widget._text_label.text() == "Zebra: Disconnected"
     # No polls should have happened yet — start() was never called.
-    assert stub_printer_service["is_available_calls"] == []
-    assert stub_printer_service["find_calls"] == 0
+    assert stub_printer_service["list_calls"] == 0
 
 
 def test_start_runs_immediate_check_and_emits_online(
     qtbot, stub_printer_service
 ):
     """Calling start() should poll immediately and transition to online."""
-    stub_printer_service["available"] = True
+    stub_printer_service["names"] = ["Zebra"]
     widget = PrinterStatusWidget(poll_interval_ms=10_000, printer_name="Zebra")
     qtbot.addWidget(widget)
 
@@ -103,7 +94,7 @@ def test_start_runs_immediate_check_and_emits_online(
 
 def test_check_status_emits_on_transition(qtbot, stub_printer_service):
     """Transition False -> True emits exactly one statusChanged(True)."""
-    stub_printer_service["available"] = True
+    stub_printer_service["names"] = ["Zebra"]
     widget = PrinterStatusWidget(poll_interval_ms=10_000, printer_name="Zebra")
     qtbot.addWidget(widget)
 
@@ -115,7 +106,7 @@ def test_check_status_emits_on_transition(qtbot, stub_printer_service):
 
 def test_check_status_no_emit_on_same_state(qtbot, stub_printer_service):
     """Polling twice while the state is unchanged emits only once."""
-    stub_printer_service["available"] = True
+    stub_printer_service["names"] = ["Zebra"]
     widget = PrinterStatusWidget(poll_interval_ms=10_000, printer_name="Zebra")
     qtbot.addWidget(widget)
 
@@ -128,6 +119,18 @@ def test_check_status_no_emit_on_same_state(qtbot, stub_printer_service):
     assert emissions == [True]
 
 
+def test_single_enumeration_per_poll(qtbot, stub_printer_service):
+    """Auto-detect resolves target and availability from one enumeration."""
+    stub_printer_service["names"] = ["Zebra GC420D"]
+    widget = PrinterStatusWidget(poll_interval_ms=10_000, printer_name="")
+    qtbot.addWidget(widget)
+
+    widget._check_status()
+
+    assert stub_printer_service["list_calls"] == 1
+    assert widget.is_online() is True
+
+
 def test_check_status_toggles(qtbot, stub_printer_service):
     """True -> False -> True yields exactly three emissions."""
     widget = PrinterStatusWidget(poll_interval_ms=10_000, printer_name="Zebra")
@@ -137,11 +140,11 @@ def test_check_status_toggles(qtbot, stub_printer_service):
     widget.statusChanged.connect(emissions.append)
 
     # After construction the widget is offline. Starting from offline:
-    stub_printer_service["available"] = True
+    stub_printer_service["names"] = ["Zebra"]
     widget._check_status()  # -> True  (emit)
-    stub_printer_service["available"] = False
+    stub_printer_service["names"] = []
     widget._check_status()  # -> False (emit)
-    stub_printer_service["available"] = True
+    stub_printer_service["names"] = ["Zebra"]
     widget._check_status()  # -> True  (emit)
 
     assert emissions == [True, False, True]
@@ -153,39 +156,34 @@ def test_check_status_toggles(qtbot, stub_printer_service):
 
 
 def test_auto_detect_when_printer_name_empty(qtbot, stub_printer_service):
-    """Empty printer_name should trigger find_zebra_printer on every poll."""
-    stub_printer_service["available"] = True
-    stub_printer_service["find_result"] = "Some Zebra Clone"
+    """Empty printer_name should discover the Zebra among installed printers."""
+    stub_printer_service["names"] = ["Microsoft Print to PDF", "Some Zebra Clone"]
     widget = PrinterStatusWidget(poll_interval_ms=10_000, printer_name="")
     qtbot.addWidget(widget)
 
     widget._check_status()
 
-    assert stub_printer_service["find_calls"] == 1
-    assert stub_printer_service["is_available_calls"] == ["Some Zebra Clone"]
     assert widget.is_online() is True
+    assert widget.resolved_printer_name() == "Some Zebra Clone"
 
 
 def test_auto_detect_none_marks_offline(qtbot, stub_printer_service):
-    """If find_zebra_printer returns None, widget stays offline without
-    querying is_printer_available at all."""
-    stub_printer_service["available"] = True
-    stub_printer_service["find_result"] = None
+    """No Zebra among the installed printers leaves the widget offline."""
+    stub_printer_service["names"] = ["Microsoft Print to PDF", "HP LaserJet"]
     widget = PrinterStatusWidget(poll_interval_ms=10_000, printer_name="")
     qtbot.addWidget(widget)
 
     widget._check_status()
 
     assert widget.is_online() is False
-    assert stub_printer_service["find_calls"] == 1
-    assert stub_printer_service["is_available_calls"] == []
+    assert widget.resolved_printer_name() == ""
 
 
 def test_explicit_printer_name_used_when_provided(
     qtbot, stub_printer_service
 ):
-    """A non-empty printer_name should bypass find_zebra_printer."""
-    stub_printer_service["available"] = True
+    """A non-empty printer_name should be used verbatim, not auto-detected."""
+    stub_printer_service["names"] = ["ZDesigner GC420D", "Some Zebra Clone"]
     widget = PrinterStatusWidget(
         poll_interval_ms=10_000, printer_name="ZDesigner GC420D"
     )
@@ -193,13 +191,29 @@ def test_explicit_printer_name_used_when_provided(
 
     widget._check_status()
 
-    assert stub_printer_service["find_calls"] == 0
-    assert stub_printer_service["is_available_calls"] == ["ZDesigner GC420D"]
+    assert widget.is_online() is True
+    # The Zebra-named printer is present but must not win over the override.
+    assert widget.resolved_printer_name() == "ZDesigner GC420D"
+
+
+def test_explicit_printer_name_absent_marks_offline(
+    qtbot, stub_printer_service
+):
+    """An override naming a printer that isn't installed reads as offline."""
+    stub_printer_service["names"] = ["Some Zebra Clone"]
+    widget = PrinterStatusWidget(
+        poll_interval_ms=10_000, printer_name="ZDesigner GC420D"
+    )
+    qtbot.addWidget(widget)
+
+    widget._check_status()
+
+    assert widget.is_online() is False
 
 
 def test_set_printer_name_triggers_recheck(qtbot, stub_printer_service):
-    """set_printer_name should immediately re-poll."""
-    stub_printer_service["available"] = True
+    """set_printer_name should immediately re-poll against the new target."""
+    stub_printer_service["names"] = ["Old Printer", "New Printer"]
     widget = PrinterStatusWidget(
         poll_interval_ms=10_000, printer_name="Old Printer"
     )
@@ -207,15 +221,14 @@ def test_set_printer_name_triggers_recheck(qtbot, stub_printer_service):
 
     # Prime: one poll against "Old Printer".
     widget._check_status()
-    assert stub_printer_service["is_available_calls"] == ["Old Printer"]
+    assert widget.resolved_printer_name() == "Old Printer"
+    calls_after_first = stub_printer_service["list_calls"]
 
     # Re-point at a new printer. set_printer_name should issue another poll.
     widget.set_printer_name("New Printer")
 
-    assert stub_printer_service["is_available_calls"] == [
-        "Old Printer",
-        "New Printer",
-    ]
+    assert stub_printer_service["list_calls"] == calls_after_first + 1
+    assert widget.resolved_printer_name() == "New Printer"
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +267,7 @@ def test_check_status_never_crashes_on_exception(qtbot, stub_printer_service):
     propagates nothing."""
     # First make the widget believe the printer is online so we can observe
     # the transition to offline caused by the exception.
-    stub_printer_service["available"] = True
+    stub_printer_service["names"] = ["Zebra"]
     widget = PrinterStatusWidget(poll_interval_ms=10_000, printer_name="Zebra")
     qtbot.addWidget(widget)
     widget._check_status()

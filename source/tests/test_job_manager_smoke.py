@@ -97,16 +97,33 @@ def job_manager_window(qtbot, monkeypatch, tmp_path):
         "transfer_history.DEFAULT_HISTORY_DIR", str(tmp_path / "history")
     )
 
-    # Suppress the "check for updates" background thread.
+    # Suppress the "check for updates" background thread and the deferred
+    # Archive->Printed migration, both of which go through singleShot.
     monkeypatch.setattr(
         "job_manager.QTimer.singleShot", lambda *a, **k: None
+    )
+
+    # Keep the printer poll off the real spooler — the window starts it
+    # during construction.
+    monkeypatch.setattr(
+        "printer_status_widget.list_printers", lambda: []
     )
 
     from job_manager import JobManager
 
     window = JobManager()
     qtbot.addWidget(window)
+    # The job scan runs on a worker thread now, so wait for the tree to be
+    # populated before handing the window to the test.
+    with qtbot.waitSignal(window.jobsRefreshed, timeout=5000):
+        pass
     return window
+
+
+def _refresh_and_wait(qtbot, window) -> None:
+    """Trigger a refresh and block until the background scan is applied."""
+    with qtbot.waitSignal(window.jobsRefreshed, timeout=5000):
+        window._refresh_preserving_selection()
 
 
 # -- tree structure ---------------------------------------------------------
@@ -223,7 +240,7 @@ def test_no_selection_hides_restore_disables_actions(job_manager_window) -> None
 
 
 def test_refresh_preserving_selection_keeps_active_job(
-    job_manager_window,
+    qtbot, job_manager_window,
 ) -> None:
     window = job_manager_window
     root = window.jobTreeWidget.topLevelItem(0)
@@ -235,7 +252,7 @@ def test_refresh_preserving_selection_keeps_active_job(
     assert target is not None
     window.jobTreeWidget.setCurrentItem(target)
 
-    window._refresh_preserving_selection()
+    _refresh_and_wait(qtbot, window)
 
     still_selected = window._selected_job()
     assert still_selected is not None
@@ -244,7 +261,7 @@ def test_refresh_preserving_selection_keeps_active_job(
 
 
 def test_refresh_preserving_selection_keeps_printed_job(
-    job_manager_window,
+    qtbot, job_manager_window,
 ) -> None:
     window = job_manager_window
     printed_root = window.jobTreeWidget.topLevelItem(1)
@@ -252,9 +269,130 @@ def test_refresh_preserving_selection_keeps_printed_job(
     target_name = target.data(0, Qt.UserRole).name
     window.jobTreeWidget.setCurrentItem(target)
 
-    window._refresh_preserving_selection()
+    _refresh_and_wait(qtbot, window)
 
     still_selected = window._selected_job()
     assert still_selected is not None
     assert still_selected.name == target_name
     assert still_selected.is_printed is True
+
+
+# -- refresh efficiency -----------------------------------------------------
+#
+# The tree is rebuilt by a timer several times a minute. These tests pin the
+# behaviour that keeps that from being felt: an unchanged scan must not touch
+# the tree at all, and a rebuild that does happen must not move the user.
+
+
+def test_refresh_with_unchanged_jobs_skips_rebuild(qtbot, job_manager_window):
+    """A scan returning identical jobs must not rebuild the tree.
+
+    Rebuilding discards and recreates every row, which costs the user their
+    scroll position and expansion state. Since the scan result is usually
+    identical, skipping is the common path.
+    """
+    window = job_manager_window
+    before = window.jobTreeWidget.topLevelItem(0).child(0)
+
+    _refresh_and_wait(qtbot, window)
+
+    # Identical content -> the very same item objects are still in the tree.
+    assert window.jobTreeWidget.topLevelItem(0).child(0) is before
+
+
+def test_refresh_rebuilds_when_jobs_change(qtbot, job_manager_window, monkeypatch):
+    """A scan returning different jobs must rebuild the tree."""
+    window = job_manager_window
+    monkeypatch.setattr(
+        "job_manager.scan_jobs",
+        lambda: [_make_job("Brand New Job", has_mdb=True)],
+    )
+
+    _refresh_and_wait(qtbot, window)
+
+    root = window.jobTreeWidget.topLevelItem(0)
+    names = {
+        root.child(i).data(0, Qt.UserRole).name for i in range(root.childCount())
+    }
+    assert names == {"Brand New Job"}
+
+
+def test_refresh_preserves_expanded_printed_root(
+    qtbot, job_manager_window, monkeypatch
+):
+    """Expanding Printed Jobs must survive a background refresh.
+
+    Previously every rebuild hardcoded the Printed root collapsed, so a user
+    who opened it had it snap shut within seconds.
+    """
+    window = job_manager_window
+    window.jobTreeWidget.topLevelItem(1).setExpanded(True)
+
+    # Force an actual rebuild so we're testing preservation, not the skip.
+    monkeypatch.setattr(
+        "job_manager.scan_jobs",
+        lambda: [_make_job("Another Job", has_mdb=True)],
+    )
+    _refresh_and_wait(qtbot, window)
+
+    assert window.jobTreeWidget.topLevelItem(1).isExpanded() is True
+
+
+def test_history_read_once_per_rebuild(qtbot, job_manager_window, monkeypatch):
+    """Building the tree must read the history file once, not once per job."""
+    window = job_manager_window
+    calls = []
+    original = window._history.get_all_statuses
+    monkeypatch.setattr(
+        window._history,
+        "get_all_statuses",
+        lambda: (calls.append(1), original())[1],
+    )
+    # Change the jobs so a real rebuild happens.
+    monkeypatch.setattr(
+        "job_manager.scan_jobs",
+        lambda: [_make_job(f"Job {i}", has_mdb=True) for i in range(10)],
+    )
+
+    _refresh_and_wait(qtbot, window)
+
+    assert window.jobTreeWidget.topLevelItem(0).childCount() == 10
+    assert len(calls) == 1
+
+
+def test_busy_ui_pauses_polling(job_manager_window):
+    """Long operations must park the refresh timer.
+
+    Otherwise the timer keeps scanning the same S: share the worker thread is
+    copying from, competing for the one SMB connection.
+    """
+    window = job_manager_window
+    assert window._refresh_timer.isActive() is True
+
+    window._set_ui_busy(True)
+    assert window._refresh_timer.isActive() is False
+
+    window._set_ui_busy(False)
+    assert window._refresh_timer.isActive() is True
+
+
+def test_scan_threads_do_not_accumulate(qtbot, job_manager_window, monkeypatch):
+    """Finished scan threads must be retired, not left parented to the window.
+
+    The refresh timer starts a thread every few seconds for the life of the
+    process, so a thread that is never dropped is an unbounded leak.
+    """
+    from job_scan_worker import JobScanThread
+
+    window = job_manager_window
+    for i in range(5):
+        monkeypatch.setattr(
+            "job_manager.scan_jobs",
+            lambda i=i: [_make_job(f"Job {i}", has_mdb=True)],
+        )
+        _refresh_and_wait(qtbot, window)
+
+    # Let queued deleteLater calls run.
+    qtbot.wait(50)
+    live = [c for c in window.children() if isinstance(c, JobScanThread)]
+    assert len(live) <= 1

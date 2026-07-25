@@ -79,7 +79,7 @@ def build_display_name(folder_name: str, files: JobFiles) -> str:
     return f"{folder_name}-{job_id}"
 
 
-def scan_folder_files(folder_path: str) -> JobFiles:
+def scan_folder_files(folder_path: str, verified_dir: bool = False) -> JobFiles:
     """Recursively scan a folder and categorize files by extension.
 
     Handles both flat layouts (all files in root) and nested layouts
@@ -87,6 +87,10 @@ def scan_folder_files(folder_path: str) -> JobFiles:
 
     Args:
         folder_path: Absolute path to the job folder.
+        verified_dir: Set by callers that have *already* established the path
+            is a directory (e.g. via ``os.scandir``'s cached attributes), to
+            skip an otherwise redundant ``stat``. Over SMB that stat is a
+            network round-trip per job folder, so the scan loops pass True.
 
     Returns:
         Frozen JobFiles with tuples of absolute paths.
@@ -95,7 +99,7 @@ def scan_folder_files(folder_path: str) -> JobFiles:
         field: [] for field in _EXTENSION_MAP.values()
     }
 
-    if not os.path.isdir(folder_path):
+    if not verified_dir and not os.path.isdir(folder_path):
         logger.warning("Folder does not exist: %s", folder_path)
         return JobFiles(
             nc_files=(),

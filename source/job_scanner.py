@@ -55,29 +55,30 @@ def _scan_source_directory(source_name: str, source_path: str) -> list[Job]:
         )
         return jobs
 
+    # scandir over listdir+isdir: the directory enumeration already carries
+    # each entry's attributes, so is_dir() is answered from that cached data
+    # instead of issuing a fresh stat per entry. Over SMB that halves the
+    # round-trips for this loop.
     try:
-        entries = os.listdir(source_path)
+        with os.scandir(source_path) as entries:
+            candidates = [(e.name, e.path) for e in entries if e.is_dir()]
     except OSError:
         logger.warning(
             "Cannot read source directory: %s (%s)", source_name, source_path
         )
         return jobs
 
-    for entry in entries:
-        job_path = os.path.join(source_path, entry)
-        if not os.path.isdir(job_path):
-            continue
-
-        files = scan_folder_files(job_path)
+    for name, job_path in candidates:
+        files = scan_folder_files(job_path, verified_dir=True)
         job_type = detect_job_type(files)
 
         jobs.append(Job(
-            name=entry,
+            name=name,
             path=job_path,
             job_type=job_type,
             files=files,
             source_folder=source_name,
-            display_name=build_display_name(entry, files),
+            display_name=build_display_name(name, files),
         ))
 
     logger.info("Found %d jobs in %s", len(jobs), source_name)
@@ -128,26 +129,23 @@ def scan_printed_jobs(printed_path: str = PRINTED_DIR) -> list[Job]:
         return jobs
 
     try:
-        entries = os.listdir(printed_path)
+        with os.scandir(printed_path) as entries:
+            candidates = [(e.name, e.path) for e in entries if e.is_dir()]
     except OSError:
         logger.warning("Cannot read printed directory: %s", printed_path)
         return jobs
 
-    for entry in entries:
-        job_path = os.path.join(printed_path, entry)
-        if not os.path.isdir(job_path):
-            continue
-
-        files = scan_folder_files(job_path)
+    for name, job_path in candidates:
+        files = scan_folder_files(job_path, verified_dir=True)
         job_type = detect_job_type(files)
 
         jobs.append(Job(
-            name=entry,
+            name=name,
             path=job_path,
             job_type=job_type,
             files=files,
             source_folder="Printed",
-            display_name=build_display_name(entry, files),
+            display_name=build_display_name(name, files),
             is_printed=True,
         ))
 

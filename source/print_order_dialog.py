@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QSize, Qt
 from PyQt5.QtGui import QBrush, QColor, QFont
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -127,15 +127,10 @@ class PrintOrderDialog(QDialog):
             text = f"  {material}   -   {count} {label_word}"
             item = QListWidgetItem(text)
             item.setData(Qt.UserRole, material)
-            item.setSizeHint(
-                self._list.sizeHintForIndex(
-                    self._list.model().index(index, 0)
-                )
-            )
-            # Explicit row height. sizeHintForIndex can return an invalid size
-            # before the item is inserted, so fall back to a fixed 50px.
-            current = item.sizeHint()
-            item.setSizeHint(current.expandedTo(current.__class__(0, 50)))
+            # Explicit row height. The item is not in the model yet, so asking
+            # the view for a size hint here would query an invalid index and
+            # return an empty size that this line overwrites anyway.
+            item.setSizeHint(QSize(0, 50))
             brush = QBrush(palette[index % len(palette)])
             item.setBackground(brush)
             item.setForeground(QBrush(QColor(30, 30, 30)))

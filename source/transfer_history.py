@@ -48,6 +48,11 @@ class TransferHistory:
         self._dir = history_dir or DEFAULT_HISTORY_DIR
         os.makedirs(self._dir, exist_ok=True)
         self._path = os.path.join(self._dir, "history.json")
+        # Parsed-file cache, validated against the file's (mtime_ns, size).
+        # The job tree asks for one status per job on every refresh; without
+        # this each of those re-opened and re-parsed the whole file.
+        self._cache: dict | None = None
+        self._cache_stamp: tuple[int, int] | None = None
 
     # -- public API --------------------------------------------------
 
@@ -144,21 +149,67 @@ class TransferHistory:
             return "In Progress"
         return "Ready"
 
+    def get_all_statuses(self) -> dict[str, str]:
+        """Return ``{job_name: status}`` for every tracked job in one read.
+
+        Equivalent to calling :meth:`get_status` per job, but parses the
+        history file once instead of once per lookup. Callers that need
+        statuses for a whole list of jobs should prefer this. Untracked jobs
+        are simply absent — treat a missing key as ``"Ready"``.
+        """
+        statuses: dict[str, str] = {}
+        for job_name, entry in self._read_jobs().items():
+            if entry.get("completed_at") is not None:
+                statuses[job_name] = "Printed"
+            elif (
+                entry.get("transferred")
+                or entry.get("printed")
+                or entry.get("nc_copied")
+            ):
+                statuses[job_name] = "In Progress"
+            else:
+                statuses[job_name] = "Ready"
+        return statuses
+
     # -- internal helpers --------------------------------------------
 
+    def _stamp(self) -> tuple[int, int] | None:
+        """Return the history file's (mtime_ns, size), or None if absent."""
+        try:
+            st = os.stat(self._path)
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
     def _read_all(self) -> dict:
-        """Load the full JSON file, returning an empty structure on error."""
-        if not os.path.exists(self._path):
+        """Load the full JSON file, returning an empty structure on error.
+
+        The parsed result is cached and reused while the file's
+        (mtime_ns, size) is unchanged, so repeated lookups cost one ``stat``
+        rather than a full open + parse. An external writer that modifies the
+        file invalidates the cache naturally via the stamp.
+        """
+        stamp = self._stamp()
+        if stamp is None:
+            self._cache = None
+            self._cache_stamp = None
             return {"jobs": {}}
+
+        if self._cache is not None and self._cache_stamp == stamp:
+            return self._cache
+
         try:
             with open(self._path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
             if not isinstance(data.get("jobs"), dict):
-                return {"jobs": {}}
-            return data
+                data = {"jobs": {}}
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Failed to read history file: %s", exc)
             return {"jobs": {}}
+
+        self._cache = data
+        self._cache_stamp = stamp
+        return data
 
     def _read_jobs(self) -> dict:
         return self._read_all()["jobs"]
@@ -177,7 +228,16 @@ class TransferHistory:
             # Clean up temp file on failure.
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
+            # The on-disk state is now unknown — drop the cache so the next
+            # read goes back to the file rather than trusting stale data.
+            self._cache = None
+            self._cache_stamp = None
             raise
+
+        # Adopt what we just wrote as the cache, stamped with the new file
+        # identity so the next read is served without re-parsing.
+        self._cache = data
+        self._cache_stamp = self._stamp()
 
     def _ensure_record(self, job_name: str, job_type: str) -> JobRecord:
         """Return existing record or create a blank one (not persisted)."""
@@ -188,6 +248,8 @@ class TransferHistory:
 
     def _save_record(self, record: JobRecord) -> None:
         """Persist a single record into the history file."""
-        data = self._read_all()
-        data["jobs"][record.job_name] = asdict(record)
+        current = self._read_all()
+        # Copy before mutating: _read_all may have handed back the cached
+        # dict, and the cache must not reflect a write that later fails.
+        data = {**current, "jobs": {**current["jobs"], record.job_name: asdict(record)}}
         self._write_all(data)
