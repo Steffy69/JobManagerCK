@@ -427,3 +427,49 @@ def test_clear_queue_no_printer_shows_warning(qtbot, monkeypatch) -> None:
 
     assert cleared == []
     assert len(warn_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Display group (accessibility text size)
+# ---------------------------------------------------------------------------
+
+
+def test_font_size_default_selected(qtbot, monkeypatch) -> None:
+    monkeypatch.setattr("settings_dialog.save_settings", lambda *a, **k: None)
+    dlg = SettingsDialog(AppSettings())
+    qtbot.addWidget(dlg)
+
+    assert dlg.font_size_combo.currentData() == 0
+    assert dlg.font_size_combo.currentText() == "System default"
+
+
+def test_font_size_collected_into_settings(qtbot, monkeypatch) -> None:
+    monkeypatch.setattr("settings_dialog.save_settings", lambda *a, **k: None)
+    dlg = SettingsDialog(AppSettings())
+    qtbot.addWidget(dlg)
+
+    index = dlg.font_size_combo.findData(14)
+    assert index >= 0
+    dlg.font_size_combo.setCurrentIndex(index)
+
+    assert dlg._collect_settings().ui_font_size == 14
+
+
+def test_font_size_preselects_saved_value(qtbot, monkeypatch) -> None:
+    monkeypatch.setattr("settings_dialog.save_settings", lambda *a, **k: None)
+    dlg = SettingsDialog(AppSettings(ui_font_size=18))
+    qtbot.addWidget(dlg)
+
+    assert dlg.font_size_combo.currentData() == 18
+
+
+def test_font_size_nonpreset_value_shown_as_custom(qtbot, monkeypatch) -> None:
+    """A hand-edited settings.json size that isn't a preset must be shown
+    honestly, not silently snapped to a different size."""
+    monkeypatch.setattr("settings_dialog.save_settings", lambda *a, **k: None)
+    dlg = SettingsDialog(AppSettings(ui_font_size=11))
+    qtbot.addWidget(dlg)
+
+    assert dlg.font_size_combo.currentData() == 11
+    assert "Custom" in dlg.font_size_combo.currentText()
+    assert dlg._collect_settings().ui_font_size == 11

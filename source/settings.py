@@ -20,6 +20,8 @@ SETTINGS_PATH = os.path.join(SETTINGS_DIR, "settings.json")
 _MIN_PRINT_DELAY = 0.5
 _MAX_PRINT_DELAY = 30.0
 _MIN_POLL_INTERVAL_MS = 1000
+_MIN_FONT_SIZE = 7
+_MAX_FONT_SIZE = 24
 
 
 @dataclass(frozen=True)
@@ -41,6 +43,9 @@ class AppSettings:
     auto_mark_printed: bool = False
     status_poll_interval_ms: int = 10000
     zebra_printer_name: str = ""
+    # Application-wide text size in points; 0 means "system default".
+    # Accessibility knob — the workshop PC is read at arm's length.
+    ui_font_size: int = 0
 
 
 def _clamp_delay(value: Any) -> float:
@@ -63,6 +68,21 @@ def _clamp_poll_interval(value: Any) -> int:
     if interval < _MIN_POLL_INTERVAL_MS:
         return _MIN_POLL_INTERVAL_MS
     return interval
+
+
+def _clamp_font_size(value: Any) -> int:
+    """Clamp a UI font size: 0 = system default, otherwise 7-24 points."""
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        return AppSettings().ui_font_size
+    if size <= 0:
+        return 0
+    if size < _MIN_FONT_SIZE:
+        return _MIN_FONT_SIZE
+    if size > _MAX_FONT_SIZE:
+        return _MAX_FONT_SIZE
+    return size
 
 
 def _coerce_material_priority(value: Any) -> tuple[str, ...]:
@@ -97,6 +117,9 @@ def _from_dict(data: dict[str, Any]) -> AppSettings:
         ),
         zebra_printer_name=str(
             data.get("zebra_printer_name", defaults.zebra_printer_name)
+        ),
+        ui_font_size=_clamp_font_size(
+            data.get("ui_font_size", defaults.ui_font_size)
         ),
     )
 

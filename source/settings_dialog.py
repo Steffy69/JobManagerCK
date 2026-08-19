@@ -18,6 +18,7 @@ from typing import Optional
 from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
@@ -35,6 +36,18 @@ import zpl_templates
 from settings import AppSettings, save_settings, update_settings
 
 logger = logging.getLogger(__name__)
+
+# Text-size presets shown in the Display group. Friendly names beat a bare
+# points spinner for the workshop operator; the stored value is the point
+# size (0 = leave the system default alone).
+_FONT_SIZE_OPTIONS: list[tuple[str, int]] = [
+    ("System default", 0),
+    ("Small (8 pt)", 8),
+    ("Medium (10 pt)", 10),
+    ("Large (12 pt)", 12),
+    ("Extra large (14 pt)", 14),
+    ("Huge (18 pt)", 18),
+]
 
 
 class SettingsDialog(QDialog):
@@ -59,6 +72,7 @@ class SettingsDialog(QDialog):
 
         root_layout = QVBoxLayout(self)
 
+        root_layout.addWidget(self._build_display_group())
         root_layout.addWidget(self._build_behavior_group())
         root_layout.addWidget(self._build_workflow_group())
         root_layout.addWidget(self._build_troubleshooting_group())
@@ -76,6 +90,30 @@ class SettingsDialog(QDialog):
         root_layout.addWidget(self._button_box)
 
     # -- group builders --
+
+    def _build_display_group(self) -> QGroupBox:
+        group = QGroupBox("Display")
+        form = QFormLayout(group)
+
+        self.font_size_combo = QComboBox()
+        for label, size in _FONT_SIZE_OPTIONS:
+            self.font_size_combo.addItem(label, size)
+
+        current = self._initial_settings.ui_font_size
+        index = self.font_size_combo.findData(current)
+        if index < 0:
+            # A hand-edited settings.json size that isn't a preset — show
+            # it honestly rather than snapping to something else.
+            self.font_size_combo.addItem(f"Custom ({current} pt)", current)
+            index = self.font_size_combo.count() - 1
+        self.font_size_combo.setCurrentIndex(index)
+        self.font_size_combo.setToolTip(
+            "Makes all text in Job Manager bigger or smaller. "
+            "Takes effect as soon as you press Apply or OK."
+        )
+        form.addRow("Text size:", self.font_size_combo)
+
+        return group
 
     def _build_behavior_group(self) -> QGroupBox:
         group = QGroupBox("Printing Behavior")
@@ -172,6 +210,7 @@ class SettingsDialog(QDialog):
             ),
             print_separators=self.print_separators_checkbox.isChecked(),
             auto_mark_printed=self.auto_mark_printed_checkbox.isChecked(),
+            ui_font_size=int(self.font_size_combo.currentData()),
         )
 
     def _commit(self) -> Optional[AppSettings]:

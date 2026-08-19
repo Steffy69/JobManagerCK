@@ -142,3 +142,21 @@ def test_default_path_constants_use_home_dir():
     assert settings_module.SETTINGS_PATH == os.path.join(
         settings_module.SETTINGS_DIR, "settings.json"
     )
+
+
+def test_font_size_clamping(tmp_path):
+    """0 = system default; anything else lands in the readable 7-24 range."""
+    import json
+
+    path = tmp_path / "settings.json"
+    for raw, expected in [
+        (0, 0), (-3, 0), (3, 7), (14, 14), (100, 24), ("abc", 0),
+    ]:
+        path.write_text(json.dumps({"ui_font_size": raw}))
+        assert load_settings(str(path)).ui_font_size == expected, raw
+
+
+def test_font_size_roundtrip(tmp_path):
+    path = tmp_path / "settings.json"
+    save_settings(update_settings(AppSettings(), ui_font_size=14), str(path))
+    assert load_settings(str(path)).ui_font_size == 14

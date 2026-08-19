@@ -57,6 +57,7 @@ from printer_status_widget import PrinterStatusWidget
 from settings import AppSettings, load_settings, save_settings, update_settings
 from settings_dialog import SettingsDialog
 from transfer_history import TransferHistory
+from ui_font import apply_ui_font_size
 from update_flow import UpdateFlow
 from updater import CURRENT_VERSION
 from usb_transfer import USBTransferThread, detect_usb_drives
@@ -990,6 +991,10 @@ class JobManager(QMainWindow):
         """
         self._settings = new_settings
 
+        # Text size takes effect immediately — the whole point is that the
+        # operator can see the change while the dialog is still open.
+        apply_ui_font_size(new_settings.ui_font_size)
+
         # The parallel Phase 5 agent owns the PrinterStatusWidget. Check
         # for its presence so this method is safe to run before that
         # widget is wired up.
@@ -1081,6 +1086,9 @@ if __name__ == "__main__":
     setup_logging()
     logger.info("Job Manager CK v%s starting", CURRENT_VERSION)
     app = QApplication(sys.argv)
+    # Apply the accessibility font size BEFORE any widget is created so
+    # everything lays itself out at the right size from the start.
+    apply_ui_font_size(load_settings().ui_font_size)
     window = JobManager()
     window.show()
     sys.exit(app.exec_())
