@@ -19,7 +19,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 logger = logging.getLogger(__name__)
 
-CURRENT_VERSION = "2.2.0"
+CURRENT_VERSION = "2.2.1"
 GITHUB_API_URL = (
     "https://api.github.com/repos/Steffy69/JobManagerCK/releases/latest"
 )
